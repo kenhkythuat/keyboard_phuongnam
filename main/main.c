@@ -52,6 +52,10 @@
 #define DISPLAY_ROWS               3U
 #define DISPLAY_COLUMNS            6U
 
+void control_display_led_init(void);
+void control_display_led_set_segments(
+    const uint8_t segments[DISPLAY_ROWS][DISPLAY_COLUMNS]);
+
 #define RX_SLOT_COUNT              16U
 
 /*
@@ -745,6 +749,8 @@ static void process_capture_sample(
     );
 
     bool display_completed = false;
+    bool update_physical_display = false;
+    uint8_t physical_display[DISPLAY_ROWS][DISPLAY_COLUMNS] = {0};
 
     if (sample->received_bits ==
         EXPECTED_CAPTURE_BITS) {
@@ -873,10 +879,24 @@ static void process_capture_sample(
 
             s_display_complete_count++;
             s_display_generation++;
+
+            memcpy(
+                physical_display,
+                complete_display.display,
+                sizeof(physical_display)
+            );
+
+            update_physical_display = true;
         }
     }
 
     portEXIT_CRITICAL(&s_shared_lock);
+
+    if (update_physical_display) {
+        control_display_led_set_segments(
+            physical_display
+        );
+    }
 }
 
 /* =========================================================
@@ -1508,6 +1528,7 @@ static void mbi_report_task(void *argument)
 void app_main(void)
 {
     reset_display_assembly();
+    control_display_led_init();
 
     s_decode_queue = xQueueCreate(
         1,
