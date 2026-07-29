@@ -34,7 +34,7 @@
  * 0: QuÃ©t 6 cá»™t, má»—i cá»™t lÃ m sÃ¡ng Ä‘á»“ng thá»i cáº£ 3 hÃ ng.
  *    SÃ¡ng hÆ¡n nhÆ°ng dÃ²ng qua transistor cá»™t cÃ³ thá»ƒ ráº¥t lá»›n.
  */
-#define SAFE_ONE_DIGIT_SCAN    1
+#define SAFE_ONE_DIGIT_SCAN    0
 
 #if SAFE_ONE_DIGIT_SCAN
     /*
@@ -44,11 +44,13 @@
     #define SCAN_PERIOD_US     500
 #else
     /*
-     * 6 slot x 1000 us = 6 ms/frame
-     * Táº§n sá»‘ lÃ m tÆ°Æ¡i khoáº£ng 166 Hz.
+     * 6 slot x 300 us = 1,8 ms/frame
+     * Táº§n sá»‘ lÃ m tÆ°Æ¡i khoáº£ng 555 Hz.
      */
-    #define SCAN_PERIOD_US     1000
+    #define SCAN_PERIOD_US     300
 #endif
+
+#define MBI_SHIFT_DELAY_US     0
 
 static const char *TAG = "MBI5026_7SEG";
 
@@ -107,11 +109,9 @@ static inline void mbi5026_shift_word_msb(uint16_t value)
 
         gpio_set_level(PIN_CLK, 1);
 
-        /*
-         * MBI5026 há»— trá»£ CLK khÃ¡ cao.
-         * Delay 1 us dÃ¹ng Ä‘á»ƒ test pháº§n cá»©ng á»•n Ä‘á»‹nh, dá»… Ä‘o oscilloscope.
-         */
-        esp_rom_delay_us(1);
+#if MBI_SHIFT_DELAY_US > 0
+        esp_rom_delay_us(MBI_SHIFT_DELAY_US);
+#endif
 
         gpio_set_level(PIN_CLK, 0);
     }

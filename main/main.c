@@ -63,6 +63,8 @@ void control_display_led_set_segments(
  * mới được xác nhận.
  */
 #define COLUMN_CONFIRM_COUNT       4U
+#define BLANK_COLUMN_CONFIRM_COUNT 8U
+#define LIVE_BLANK_CONFIRM_COUNT   4U
 
 /*
  * OUT8 và OUT9 của U2 không sử dụng trong schematic,
@@ -77,7 +79,8 @@ void control_display_led_set_segments(
  * Đây đúng với màn hình thực tế hiện tại của bạn.
  */
 #define ENABLE_BLANK_COLUMN1_FALLBACK  1
-#define BLANK_COLUMN1_TIMEOUT_US       1500000LL
+#define BLANK_COLUMN1_TIMEOUT_US       1000000LL
+#define FILTER_COLUMN1_ROW2_ROW3_GHOST 1
 
 static int64_t s_column1_missing_since_us = 0;
 
@@ -88,7 +91,6 @@ static int64_t s_column1_missing_since_us = 0;
 #define COLUMN_CONFIDENCE_MAX      12U
 
 #define CAPTURE_YIELD_INTERVAL     16U
-#define DECODE_DELAY_MS            5U
 #define REPORT_PERIOD_MS           1000U
 
 static const char *TAG = "MBI_SNIFFER";
@@ -181,6 +183,9 @@ static uint8_t s_assembly_confidence[DISPLAY_COLUMNS];
 static uint8_t s_assembly_confirmed_mask = 0;
 
 static int64_t s_assembly_start_us = 0;
+
+static uint8_t s_live_display[DISPLAY_ROWS][DISPLAY_COLUMNS];
+static uint8_t s_live_blank_confidence[DISPLAY_COLUMNS];
 
 /* =========================================================
  * Kiểm tra column mask
@@ -391,6 +396,19 @@ static void evaluate_bit_offset(
          *
          * 0x00 cũng được xem là blank hợp lệ.
          */
+#if FILTER_COLUMN1_ROW2_ROW3_GHOST
+        /*
+         * Cot 1 tren man hinh nay chi dung hang 1; hang 2 va hang 3
+         * phai tat. Neu row2/row3 sang thi day thuong la ghost frame.
+         */
+        if (column == 0U &&
+            (row2 != 0x00U ||
+             row3 != 0x00U)) {
+
+            continue;
+        }
+#endif
+
         if (!is_known_segment(row1) ||
             !is_known_segment(row2) ||
             !is_known_segment(row3)) {
@@ -400,12 +418,17 @@ static void evaluate_bit_offset(
 
         int quality = 100;
 
+        bool blank_block =
+            u1_word == 0x0000U &&
+            (u2_word & 0x00FFU) == 0x00U;
+
         /*
          * Ưu tiên dữ liệu trùng với ứng viên đang được tích lũy.
          */
         if (s_assembly_confidence[column] != 0U &&
             s_assembly_u1[column] == u1_word &&
-            s_assembly_u2[column] == u2_word) {
+            s_assembly_u2[column] == u2_word &&
+            !blank_block) {
 
             quality += 80;
         }
@@ -417,15 +440,13 @@ static void evaluate_bit_offset(
          * U1 = 0x0000
          * U2 phần segment = 0x00
          */
-        if (u1_word == 0x0000U &&
-            (u2_word & 0x00FFU) == 0x00U) {
-
-            quality += 40;
-        }
-
         /*
          * Dữ liệu bắt đầu đúng byte thường đáng tin cậy hơn.
          */
+        if (blank_block) {
+            quality -= 20;
+        }
+
         if ((bit_offset & 0x07U) == 0U) {
             quality += 5;
         }
@@ -542,6 +563,18 @@ static void reset_display_assembly(void)
         sizeof(s_assembly_confidence)
     );
 
+    memset(
+        s_live_display,
+        0,
+        sizeof(s_live_display)
+    );
+
+    memset(
+        s_live_blank_confidence,
+        0,
+        sizeof(s_live_blank_confidence)
+    );
+
     s_assembly_confirmed_mask = 0;
     s_assembly_start_us = 0;
 }
@@ -596,6 +629,84 @@ static void build_complete_display(
         complete_result->display[2][column] =
             (uint8_t)(u2_word & 0x00FFU);
     }
+}
+
+static bool update_live_display_from_candidate(
+    const mbi_decode_result_t *candidate,
+    uint8_t output[DISPLAY_ROWS][DISPLAY_COLUMNS])
+{
+    if (candidate == NULL ||
+        output == NULL ||
+        candidate->seen_columns == 0U) {
+
+        return false;
+    }
+
+    bool changed = false;
+
+    for (uint8_t column = 0;
+         column < DISPLAY_COLUMNS;
+         column++) {
+
+        uint8_t column_bit =
+            (uint8_t)(1U << column);
+
+        if ((candidate->seen_columns &
+             column_bit) == 0U) {
+
+            continue;
+        }
+
+        bool blank_column =
+            candidate->display[0][column] == 0x00U &&
+            candidate->display[1][column] == 0x00U &&
+            candidate->display[2][column] == 0x00U;
+
+        if (blank_column) {
+            if (s_live_blank_confidence[column] <
+                LIVE_BLANK_CONFIRM_COUNT) {
+
+                s_live_blank_confidence[column]++;
+            }
+
+            if (s_live_blank_confidence[column] <
+                LIVE_BLANK_CONFIRM_COUNT) {
+
+                continue;
+            }
+        } else {
+            s_live_blank_confidence[column] = 0;
+        }
+
+        for (uint8_t row = 0;
+             row < DISPLAY_ROWS;
+             row++) {
+
+            uint8_t segment =
+                candidate->display[row][column];
+
+            if (s_live_display[row][column] !=
+                segment) {
+
+                s_live_display[row][column] =
+                    segment;
+
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    memcpy(
+        output,
+        s_live_display,
+        sizeof(s_live_display)
+    );
+
+    return true;
 }
 
 /* =========================================================
@@ -697,7 +808,7 @@ static bool feed_candidate_to_assembly(
         if (s_assembly_u1[column] == 0x0000U &&
             (s_assembly_u2[column] & 0x00FFU) == 0x00U) {
 
-            required_confidence = 2U;
+            required_confidence = BLANK_COLUMN_CONFIRM_COUNT;
         }
 
         if (s_assembly_confidence[column] >=
@@ -751,6 +862,7 @@ static void process_capture_sample(
     bool display_completed = false;
     bool update_physical_display = false;
     uint8_t physical_display[DISPLAY_ROWS][DISPLAY_COLUMNS] = {0};
+    bool saw_column1_candidate = false;
 
     if (sample->received_bits ==
         EXPECTED_CAPTURE_BITS) {
@@ -762,6 +874,15 @@ static void process_capture_sample(
 
         if (candidate.valid_block_count > 0U &&
             candidate.seen_columns != 0U) {
+
+            saw_column1_candidate =
+                (candidate.seen_columns & 0x01U) != 0U;
+
+            update_physical_display =
+                update_live_display_from_candidate(
+                    &candidate,
+                    physical_display
+                );
 
             display_completed =
                 feed_candidate_to_assembly(
@@ -778,7 +899,9 @@ static void process_capture_sample(
      * 0x3E = cột 2,3,4,5,6 đã xác nhận.
      * Chỉ còn thiếu cột 1.
      */
-    if (!display_completed &&
+    if (saw_column1_candidate) {
+        s_column1_missing_since_us = 0;
+    } else if (!display_completed &&
         s_assembly_confirmed_mask == 0x3EU) {
 
         if (s_column1_missing_since_us == 0) {
@@ -880,13 +1003,15 @@ static void process_capture_sample(
             s_display_complete_count++;
             s_display_generation++;
 
-            memcpy(
-                physical_display,
-                complete_display.display,
-                sizeof(physical_display)
-            );
+            if (!update_physical_display) {
+                memcpy(
+                    physical_display,
+                    complete_display.display,
+                    sizeof(physical_display)
+                );
 
-            update_physical_display = true;
+                update_physical_display = true;
+            }
         }
     }
 
@@ -1073,7 +1198,7 @@ static void mbi_capture_task(void *argument)
                 esp_err_to_name(result)
             );
 
-            vTaskDelay(1);
+            taskYIELD();
             continue;
         }
 
@@ -1125,7 +1250,7 @@ static void mbi_capture_task(void *argument)
             CAPTURE_YIELD_INTERVAL) {
 
             yield_counter = 0;
-            vTaskDelay(1);
+            taskYIELD();
         }
     }
 }
@@ -1139,13 +1264,6 @@ static void mbi_decode_task(void *argument)
 
     mbi_capture_sample_t sample;
 
-    TickType_t decode_delay =
-        pdMS_TO_TICKS(DECODE_DELAY_MS);
-
-    if (decode_delay == 0) {
-        decode_delay = 1;
-    }
-
     while (1) {
         if (xQueueReceive(
                 s_decode_queue,
@@ -1158,7 +1276,7 @@ static void mbi_decode_task(void *argument)
              * Không cần giải mã hàng nghìn mẫu mỗi giây.
              * Luôn lấy mẫu mới nhất từ queue.
              */
-            vTaskDelay(decode_delay);
+            taskYIELD();
         }
     }
 }
