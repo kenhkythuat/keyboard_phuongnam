@@ -9,12 +9,17 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "pump_data_sniffer.h"
+
 static const char *TAG = "KEY_OUTPUT";
 
 #define ENABLE_KEYPAD               1
 #define COMBINES_KEYPAD_FUNTIONS    1
+#define ENABLE_PUMP_DATA_SNIFFER    1
 
 #define KEY_OUTPUT_PIN_COUNT        5
+
+#define ENABLE_VIRTUAL_LED_GPIO     GPIO_NUM_39
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -55,6 +60,25 @@ static const gpio_num_t key_pins[KEY_OUTPUT_PIN_COUNT] = {
     PIN_D3,
     PIN_D4
 };
+
+static void virtual_led_enable_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << ENABLE_VIRTUAL_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0));
+
+    ESP_LOGI(
+        TAG,
+        "ENABLE_VIRTUAL_LED IO39 = 0, LED do mach ngoai dieu khien"
+    );
+}
 
 static const char *key_get_name(uint8_t key_code)
 {
@@ -337,6 +361,12 @@ static void keypad_scan_task(void *argument)
 
 void app_main(void)
 {
+    virtual_led_enable_init();
+
+#if ENABLE_PUMP_DATA_SNIFFER
+    pump_data_sniffer_start();
+#endif
+
     keypad_gpio_init();
 
 #if COMBINES_KEYPAD_FUNTIONS
@@ -393,6 +423,12 @@ static esp_err_t key_press(uint8_t key_code, uint32_t hold_time_ms)
 
 void app_main(void)
 {
+    virtual_led_enable_init();
+
+#if ENABLE_PUMP_DATA_SNIFFER
+    pump_data_sniffer_start();
+#endif
+
     key_gpio_init();
     key_release();
 
