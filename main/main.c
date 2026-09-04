@@ -16,10 +16,16 @@ static const char *TAG = "KEY_OUTPUT";
 #define ENABLE_KEYPAD               1
 #define COMBINES_KEYPAD_FUNTIONS    1
 #define ENABLE_PUMP_DATA_SNIFFER    1
+#define ENABLE_AUTO_KEY_SEQUENCE    1
 
 #define KEY_OUTPUT_PIN_COUNT        5
 
 #define ENABLE_VIRTUAL_LED_GPIO     GPIO_NUM_39
+
+#define AUTO_KEY_SEQUENCE              "#122973E2522EC"
+#define AUTO_KEY_HOLD_TIME_MS          50
+#define AUTO_KEY_DELAY_BETWEEN_MS      50
+#define AUTO_KEY_REPEAT_DELAY_MS       2000
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -175,6 +181,111 @@ static void key_set_active(uint8_t key_code)
 
     key_output_code(key_code);
     key_print_status(key_code);
+}
+
+static uint8_t key_code_from_char(char character)
+{
+    switch (character) {
+        case '0': return KEY_0;
+        case '1': return KEY_1;
+        case '2': return KEY_2;
+        case '3': return KEY_3;
+        case '4': return KEY_4;
+        case '5': return KEY_5;
+        case '6': return KEY_6;
+        case '7': return KEY_7;
+        case '8': return KEY_8;
+        case '9': return KEY_9;
+        case '#': return KEY_HASH;
+        case '$': return KEY_DOLLAR;
+        case 'C':
+        case 'c': return KEY_C;
+        case 'E':
+        case 'e': return KEY_E;
+        case 'L':
+        case 'l': return KEY_L;
+        case 'P':
+        case 'p': return KEY_P;
+        case 'T':
+        case 't': return KEY_T;
+        case 'V':
+        case 'v': return KEY_V;
+        default:  return KEY_NONE;
+    }
+}
+
+static esp_err_t key_press(uint8_t key_code, uint32_t hold_time_ms)
+{
+    if (key_code < KEY_1 || key_code > KEY_C) {
+        ESP_LOGE(TAG, "Ma phim khong hop le: %u", key_code);
+        key_set_active(KEY_NONE);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    key_set_active(key_code);
+    vTaskDelay(pdMS_TO_TICKS(hold_time_ms));
+    key_set_active(KEY_NONE);
+
+    return ESP_OK;
+}
+
+static void auto_key_sequence_task(void *argument)
+{
+    (void)argument;
+
+    const char *sequence = AUTO_KEY_SEQUENCE;
+
+    ESP_LOGI(
+        TAG,
+        "Auto key sequence enabled: %s, hold=%ums, delay=%ums",
+        sequence,
+        (unsigned int)AUTO_KEY_HOLD_TIME_MS,
+        (unsigned int)AUTO_KEY_DELAY_BETWEEN_MS
+    );
+
+    while (1) {
+        for (size_t index = 0; sequence[index] != '\0'; index++) {
+            uint8_t key_code = key_code_from_char(sequence[index]);
+
+            if (key_code == KEY_NONE) {
+                ESP_LOGW(
+                    TAG,
+                    "Bo qua ky tu khong ho tro trong chuoi: %c",
+                    sequence[index]
+                );
+                continue;
+            }
+
+            ESP_LOGI(
+                TAG,
+                "Auto nhan ky tu %c -> phim %s",
+                sequence[index],
+                key_get_name(key_code)
+            );
+
+            key_press(key_code, AUTO_KEY_HOLD_TIME_MS);
+            vTaskDelay(pdMS_TO_TICKS(AUTO_KEY_DELAY_BETWEEN_MS));
+        }
+
+        ESP_LOGI(TAG, "Hoan thanh auto key sequence");
+        vTaskDelay(pdMS_TO_TICKS(AUTO_KEY_REPEAT_DELAY_MS));
+    }
+}
+
+static void auto_key_sequence_start(void)
+{
+    BaseType_t task_result = xTaskCreate(
+        auto_key_sequence_task,
+        "auto_key_sequence",
+        4096,
+        NULL,
+        4,
+        NULL
+    );
+
+    if (task_result != pdPASS) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
 }
 
 #if ENABLE_KEYPAD
@@ -375,6 +486,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Combine keypad functions enabled");
 #endif
 
+#if ENABLE_AUTO_KEY_SEQUENCE
+    auto_key_sequence_start();
+#endif
+
     BaseType_t task_result = xTaskCreate(
         keypad_scan_task,
         "keypad_scan_task",
@@ -406,21 +521,6 @@ static const uint8_t key_sequence[] = {
     KEY_T
 };
 
-static esp_err_t key_press(uint8_t key_code, uint32_t hold_time_ms)
-{
-    if (key_code < KEY_1 || key_code > KEY_C) {
-        ESP_LOGE(TAG, "Ma phim khong hop le: %u", key_code);
-        key_release();
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    key_set_active(key_code);
-    vTaskDelay(pdMS_TO_TICKS(hold_time_ms));
-    key_set_active(KEY_NONE);
-
-    return ESP_OK;
-}
-
 void app_main(void)
 {
     virtual_led_enable_init();
@@ -431,6 +531,14 @@ void app_main(void)
 
     key_gpio_init();
     key_release();
+
+#if ENABLE_AUTO_KEY_SEQUENCE
+    auto_key_sequence_start();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
 
     const size_t key_count =
         sizeof(key_sequence) / sizeof(key_sequence[0]);
