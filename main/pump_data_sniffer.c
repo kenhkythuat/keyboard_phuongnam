@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 
 #include "pump_data_sniffer.h"
+#include "pump_transaction_filter.h"
 
 /* =========================================================
  * GPIO đọc tín hiệu từ mạch bên ngoài
@@ -1206,6 +1207,10 @@ static void process_capture_sample(
         ESP_LOGI(TAG, "LED 07-12: %s", row2_string);
         ESP_LOGI(TAG, "LED 13-18: %s", row3_string);
         ESP_LOGI(TAG, "========================================");
+
+        if (!pump_transaction_filter_submit(display_to_print.display)) {
+            ESP_LOGW(TAG, "Khong the gui display sang bo loc du lieu bom");
+        }
     }
 
     if (update_physical_display) {
@@ -1840,6 +1845,15 @@ void pump_data_sniffer_start(void)
 {
     reset_display_assembly();
     control_display_led_init();
+
+    esp_err_t filter_result = pump_transaction_filter_start();
+    if (filter_result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Khoi tao bo loc du lieu bom that bai: %s",
+            esp_err_to_name(filter_result)
+        );
+    }
 
     s_decode_queue = xQueueCreate(
         1,

@@ -10,6 +10,8 @@
 #include "esp_log.h"
 
 #include "pump_data_sniffer.h"
+#include "mqtt_manager.h"
+#include "time_manager.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "KEY_OUTPUT";
@@ -480,6 +482,16 @@ void app_main(void)
         ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
     }
 
+    esp_err_t time_result = time_manager_start();
+    if (time_result != ESP_OK) {
+        ESP_LOGE(TAG, "Time manager init failed: %s", esp_err_to_name(time_result));
+    }
+
+    esp_err_t mqtt_result = mqtt_manager_start();
+    if (mqtt_result != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
+    }
+
 #if ENABLE_PUMP_DATA_SNIFFER
     pump_data_sniffer_start();
 #endif
@@ -534,6 +546,16 @@ void app_main(void)
     esp_err_t wifi_result = wifi_manager_start();
     if (wifi_result != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    }
+
+    esp_err_t time_result = time_manager_start();
+    if (time_result != ESP_OK) {
+        ESP_LOGE(TAG, "Time manager init failed: %s", esp_err_to_name(time_result));
+    }
+
+    esp_err_t mqtt_result = mqtt_manager_start();
+    if (mqtt_result != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
     }
 
 #if ENABLE_PUMP_DATA_SNIFFER
