@@ -18,6 +18,7 @@
 #include "wifi_manager.h"
 
 #define MQTT_CONNECTED_BIT              BIT0
+#define MQTT_READY_BIT                  BIT1
 #define MQTT_QOS                        1
 #define MQTT_KEEPALIVE_SECONDS          60
 #define MQTT_RECONNECT_INITIAL_MS       1000U
@@ -34,6 +35,7 @@ static mqtt_command_callback_t s_command_callback;
 static uint32_t s_reconnect_delay_ms = MQTT_RECONNECT_INITIAL_MS;
 static bool s_client_started;
 static bool s_initialized;
+static int s_command_subscribe_message_id = -1;
 
 static char s_telemetry_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_command_topic[MQTT_TOPIC_BUFFER_SIZE];
@@ -210,30 +212,42 @@ static void mqtt_event_handler(void *argument,
         case MQTT_EVENT_CONNECTED: {
             xTimerStop(s_reconnect_timer, 0);
             s_reconnect_delay_ms = MQTT_RECONNECT_INITIAL_MS;
+            xEventGroupClearBits(s_mqtt_event_group, MQTT_READY_BIT);
             xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
 
-            int message_id = esp_mqtt_client_subscribe(
+            s_command_subscribe_message_id = esp_mqtt_client_subscribe(
                 s_client,
                 s_command_topic,
                 MQTT_QOS
             );
 
-            if (message_id < 0) {
+            if (s_command_subscribe_message_id < 0) {
                 ESP_LOGE(TAG, "Subscribe command that bai: %s", s_command_topic);
             } else {
                 ESP_LOGI(
                     TAG,
-                    "MQTT connected, subscribed %s qos=%d msg_id=%d",
+                    "MQTT connected, dang subscribe %s qos=%d msg_id=%d",
                     s_command_topic,
                     MQTT_QOS,
-                    message_id
+                    s_command_subscribe_message_id
                 );
             }
             break;
         }
 
+        case MQTT_EVENT_SUBSCRIBED:
+            if (event->msg_id == s_command_subscribe_message_id) {
+                xEventGroupSetBits(s_mqtt_event_group, MQTT_READY_BIT);
+                ESP_LOGI(TAG, "MQTT ready, command topic da subscribe");
+            }
+            break;
+
         case MQTT_EVENT_DISCONNECTED:
-            xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+            xEventGroupClearBits(
+                s_mqtt_event_group,
+                MQTT_CONNECTED_BIT | MQTT_READY_BIT
+            );
+            s_command_subscribe_message_id = -1;
             ESP_LOGW(TAG, "MQTT disconnected");
             schedule_reconnect();
             break;
@@ -268,7 +282,10 @@ static void network_event_handler(void *argument,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xTimerStop(s_reconnect_timer, 0);
-        xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+        xEventGroupClearBits(
+            s_mqtt_event_group,
+            MQTT_CONNECTED_BIT | MQTT_READY_BIT
+        );
         return;
     }
 
@@ -414,6 +431,17 @@ bool mqtt_manager_is_connected(void)
     return (xEventGroupGetBits(s_mqtt_event_group) & MQTT_CONNECTED_BIT) != 0;
 }
 
+bool mqtt_manager_is_ready(void)
+{
+    if (s_mqtt_event_group == NULL) {
+        return false;
+    }
+
+    EventBits_t required_bits = MQTT_CONNECTED_BIT | MQTT_READY_BIT;
+    return (xEventGroupGetBits(s_mqtt_event_group) & required_bits) ==
+           required_bits;
+}
+
 void mqtt_manager_set_command_callback(mqtt_command_callback_t callback)
 {
     s_command_callback = callback;
@@ -421,6 +449,10 @@ void mqtt_manager_set_command_callback(mqtt_command_callback_t callback)
 
 esp_err_t mqtt_manager_publish_telemetry(const char *json_payload)
 {
+    if (!mqtt_manager_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     return publish_json(s_telemetry_topic, json_payload);
 }
 

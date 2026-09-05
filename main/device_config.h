@@ -11,3 +11,6 @@
 #define MQTT_PASSWORD       "123456789"
 
 #define MQTT_CLEAN_SESSION  1
+
+/* No decoded command-code source exists yet; replace when that flow is added. */
+#define TRANSACTION_COMMAND_CODE "P1E"

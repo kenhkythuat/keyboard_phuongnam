@@ -9,6 +9,7 @@ typedef void (*mqtt_command_callback_t)(const char *payload, size_t length);
 
 esp_err_t mqtt_manager_start(void);
 bool mqtt_manager_is_connected(void);
+bool mqtt_manager_is_ready(void);
 void mqtt_manager_set_command_callback(mqtt_command_callback_t callback);
 
 esp_err_t mqtt_manager_publish_telemetry(const char *json_payload);

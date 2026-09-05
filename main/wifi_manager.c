@@ -251,3 +251,23 @@ bool wifi_manager_wait_for_connection(uint32_t timeout_ms)
 
     return (bits & WIFI_CONNECTED_BIT) != 0;
 }
+
+esp_err_t wifi_manager_get_rssi(int8_t *rssi)
+{
+    if (rssi == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!wifi_manager_is_connected()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_ap_record_t access_point;
+    esp_err_t err = esp_wifi_sta_get_ap_info(&access_point);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *rssi = access_point.rssi;
+    return ESP_OK;
+}

@@ -1,6 +1,7 @@
 #include "pump_transaction_filter.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -9,13 +10,19 @@
 
 #include "esp_log.h"
 
+#include "cJSON.h"
+
+#include "device_config.h"
+#include "mqtt_manager.h"
 #include "time_manager.h"
+#include "wifi_manager.h"
 
 #define PUMP_DATA_STABLE_TIME_MS   10000U
-#define UNIT_PRICE_TOLERANCE_VND   100.0f
+#define AMOUNT_TOLERANCE_VND       200.0f
 #define FILTER_TASK_STACK_SIZE     4096U
 #define FILTER_TASK_PRIORITY       5U
 #define FILTER_QUEUE_LENGTH        8U
+#define TELEMETRY_JSON_SIZE        384U
 
 typedef struct {
     uint8_t segments[PUMP_TRANSACTION_DISPLAY_ROWS]
@@ -122,35 +129,128 @@ static bool parse_transaction(
            parse_display_row(message->segments, 2, &transaction->unit_price);
 }
 
+static bool command_code_is_valid(const char *command_code)
+{
+    if (command_code == NULL) {
+        return false;
+    }
+
+    size_t length = strlen(command_code);
+    if (length == 0U || length > 16U) {
+        return false;
+    }
+
+    for (size_t index = 0; index < length; index++) {
+        char character = command_code[index];
+        bool valid_character =
+            (character >= '0' && character <= '9') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= 'a' && character <= 'z') ||
+            character == '#' || character == '$' ||
+            character == '_' || character == '-';
+
+        if (!valid_character) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static esp_err_t publish_transaction_telemetry(
+    const pump_transaction_t *transaction,
+    const time_manager_snapshot_t *time_snapshot,
+    int8_t rssi)
+{
+    if (transaction == NULL || time_snapshot == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (cJSON_AddNumberToObject(root, "ts", (double)time_snapshot->ts) == NULL ||
+        cJSON_AddStringToObject(root, "version", "1.3") == NULL) {
+
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (!cJSON_AddItemToObject(root, "data", data)) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (cJSON_AddNumberToObject(data, "unit_price", transaction->unit_price) == NULL ||
+        cJSON_AddNumberToObject(data, "amount_vnd", transaction->amount_vnd) == NULL ||
+        cJSON_AddNumberToObject(data, "volume_ml", transaction->volume_ml) == NULL ||
+        cJSON_AddStringToObject(data, "command_code", TRANSACTION_COMMAND_CODE) == NULL ||
+        cJSON_AddStringToObject(data, "time_device", time_snapshot->time_device) == NULL ||
+        cJSON_AddBoolToObject(data, "is_buffered", false) == NULL ||
+        cJSON_AddNumberToObject(data, "RSSI", rssi) == NULL) {
+
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char json_payload[TELEMETRY_JSON_SIZE];
+    if (!cJSON_PrintPreallocated(
+            root,
+            json_payload,
+            sizeof(json_payload),
+            false)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    cJSON_Delete(root);
+    return mqtt_manager_publish_telemetry(json_payload);
+}
+
 static void report_completed_transaction(const pump_transaction_t *transaction)
 {
-    if (transaction->volume_ml == 0U) {
-        ESP_LOGE(TAG, "Khong the kiem tra giao dich: volume_ml=0");
+    if (transaction == NULL ||
+        transaction->unit_price == 0U ||
+        transaction->amount_vnd == 0U ||
+        transaction->volume_ml == 0U) {
+        ESP_LOGE(TAG, "Du lieu giao dich khong hop le hoac bang 0");
         return;
     }
 
-    float temp_price =
-        ((float)transaction->amount_vnd * 1000.0f) /
-        (float)transaction->volume_ml;
+    float expected_amount_vnd =
+        ((float)transaction->unit_price *
+         (float)transaction->volume_ml) /
+        1000.0f;
 
-    float difference = temp_price - (float)transaction->unit_price;
-    if (difference < 0.0f) {
-        difference = -difference;
-    }
+    float difference_vnd = fabsf(
+        (float)transaction->amount_vnd - expected_amount_vnd
+    );
 
-    if (difference > UNIT_PRICE_TOLERANCE_VND) {
+    if (difference_vnd > AMOUNT_TOLERANCE_VND) {
         ESP_LOGW(
             TAG,
             "DU LIEU BOM KHONG HOP LE: unit_price=%" PRIu32
             " amount_vnd=%" PRIu32 " volume_ml=%" PRIu32
-            " temp_price=%.2f sai_so=%.2f (cho phep +/-%.0f)",
+            " expected_amount_vnd=%.2f sai_so_vnd=%.2f (cho phep +/-%.0f)",
             transaction->unit_price,
             transaction->amount_vnd,
             transaction->volume_ml,
-            (double)temp_price,
-            (double)difference,
-            (double)UNIT_PRICE_TOLERANCE_VND
+            (double)expected_amount_vnd,
+            (double)difference_vnd,
+            (double)AMOUNT_TOLERANCE_VND
         );
+        return;
+    }
+
+    if (!command_code_is_valid(TRANSACTION_COMMAND_CODE)) {
+        ESP_LOGE(TAG, "command_code khong hop le");
         return;
     }
 
@@ -171,19 +271,51 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
         return;
     }
 
+    int8_t rssi;
+    esp_err_t rssi_result = wifi_manager_get_rssi(&rssi);
+    if (rssi_result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Giao dich hop le nhung khong lay duoc RSSI: %s",
+            esp_err_to_name(rssi_result)
+        );
+        return;
+    }
+
+    if (!mqtt_manager_is_ready()) {
+        ESP_LOGW(TAG, "Giao dich hop le nhung MQTT chua ready, khong publish");
+        return;
+    }
+
+    esp_err_t publish_result = publish_transaction_telemetry(
+        transaction,
+        &time_snapshot,
+        rssi
+    );
+    if (publish_result != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Publish MQTT telemetry that bai: %s",
+            esp_err_to_name(publish_result)
+        );
+        return;
+    }
+
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "GIAO DICH BOM HOP LE - SAN SANG GUI MQTT");
+    ESP_LOGI(TAG, "GIAO DICH BOM HOP LE - DA QUEUE MQTT TELEMETRY");
     ESP_LOGI(TAG, "unit_price=%" PRIu32, transaction->unit_price);
     ESP_LOGI(TAG, "amount_vnd=%" PRIu32, transaction->amount_vnd);
     ESP_LOGI(TAG, "volume_ml=%" PRIu32, transaction->volume_ml);
     ESP_LOGI(TAG, "ts=%" PRId64, time_snapshot.ts);
     ESP_LOGI(TAG, "time_device=%s", time_snapshot.time_device);
+    ESP_LOGI(TAG, "command_code=%s", TRANSACTION_COMMAND_CODE);
+    ESP_LOGI(TAG, "RSSI=%d dBm", (int)rssi);
     ESP_LOGI(
         TAG,
-        "temp_price=%.2f sai_so=%.2f (cho phep +/-%.0f)",
-        (double)temp_price,
-        (double)difference,
-        (double)UNIT_PRICE_TOLERANCE_VND
+        "expected_amount_vnd=%.2f sai_so_vnd=%.2f (cho phep +/-%.0f)",
+        (double)expected_amount_vnd,
+        (double)difference_vnd,
+        (double)AMOUNT_TOLERANCE_VND
     );
     ESP_LOGI(TAG, "========================================");
 }

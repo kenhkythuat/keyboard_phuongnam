@@ -8,5 +8,5 @@ idf_component_register(
         "main.c"
         "control_display_led.c"
     INCLUDE_DIRS ""
-    REQUIRES driver esp_timer esp_wifi esp_event esp_netif nvs_flash lwip mqtt
+    REQUIRES driver esp_timer esp_wifi esp_event esp_netif nvs_flash lwip mqtt json
 )
