@@ -10,13 +10,14 @@
 #include "esp_log.h"
 
 #include "pump_data_sniffer.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "KEY_OUTPUT";
 
 #define ENABLE_KEYPAD               1
 #define COMBINES_KEYPAD_FUNTIONS    1
 #define ENABLE_PUMP_DATA_SNIFFER    1
-#define ENABLE_AUTO_KEY_SEQUENCE    1
+#define ENABLE_AUTO_KEY_SEQUENCE    0
 
 #define KEY_OUTPUT_PIN_COUNT        5
 
@@ -474,6 +475,11 @@ void app_main(void)
 {
     virtual_led_enable_init();
 
+    esp_err_t wifi_result = wifi_manager_start();
+    if (wifi_result != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    }
+
 #if ENABLE_PUMP_DATA_SNIFFER
     pump_data_sniffer_start();
 #endif
@@ -524,6 +530,11 @@ static const uint8_t key_sequence[] = {
 void app_main(void)
 {
     virtual_led_enable_init();
+
+    esp_err_t wifi_result = wifi_manager_start();
+    if (wifi_result != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    }
 
 #if ENABLE_PUMP_DATA_SNIFFER
     pump_data_sniffer_start();

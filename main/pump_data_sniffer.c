@@ -94,6 +94,7 @@ static int64_t s_column1_missing_since_us = 0;
 
 #define CAPTURE_YIELD_INTERVAL     16U
 #define REPORT_PERIOD_MS           500U
+#define ENABLE_PERIODIC_REPORT_LOG 0
 
 #define INVALID_ASSEMBLY_OFFSET    0xFFU
 #define USE_FIXED_BIT_OFFSET       1
@@ -168,7 +169,9 @@ static uint32_t s_capture_other_count = 0;
 
 static uint32_t s_valid_block_total = 0;
 static uint32_t s_display_complete_count = 0;
+#if ENABLE_PERIODIC_REPORT_LOG
 static uint32_t s_assembly_timeout_count = 0;
+#endif
 
 static uint32_t s_latest_received_bits = 0;
 static uint8_t s_latest_oe_level = 0;
@@ -1626,6 +1629,7 @@ bool mbi_sniffer_get_display(
 /* =========================================================
  * Task in log
  * ========================================================= */
+#if ENABLE_PERIODIC_REPORT_LOG
 static void mbi_report_task(void *argument)
 {
     (void)argument;
@@ -1827,6 +1831,7 @@ static void mbi_report_task(void *argument)
         );
     }
 }
+#endif
 
 /* =========================================================
  * APP MAIN
@@ -1882,18 +1887,19 @@ void pump_data_sniffer_start(void)
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
 
-    BaseType_t report_result =
-        xTaskCreatePinnedToCore(
-            mbi_report_task,
-            "mbi_report_task",
-            6144,
-            NULL,
-            2,
-            NULL,
-            worker_core
-        );
+#if ENABLE_PERIODIC_REPORT_LOG
+    BaseType_t report_result = xTaskCreatePinnedToCore(
+        mbi_report_task,
+        "mbi_report_task",
+        6144,
+        NULL,
+        2,
+        NULL,
+        worker_core
+    );
 
     if (report_result != pdPASS) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
+#endif
 }
