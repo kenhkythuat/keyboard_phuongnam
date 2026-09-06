@@ -254,7 +254,15 @@ static void mqtt_event_handler(void *argument,
 
         case MQTT_EVENT_DATA:
             if (event_topic_is_command(event)) {
-                ESP_LOGI(TAG, "Nhan command MQTT, length=%d", event->data_len);
+                ESP_LOGI(
+                    TAG,
+                    "Nhan command MQTT: topic=%.*s payload=%.*s length=%d",
+                    event->topic_len,
+                    event->topic,
+                    event->data_len,
+                    event->data,
+                    event->data_len
+                );
                 if (s_command_callback != NULL) {
                     s_command_callback(event->data, (size_t)event->data_len);
                 }

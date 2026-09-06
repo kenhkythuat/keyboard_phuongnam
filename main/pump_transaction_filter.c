@@ -14,6 +14,7 @@
 
 #include "device_config.h"
 #include "mqtt_manager.h"
+#include "pump_transaction_store.h"
 #include "time_manager.h"
 #include "wifi_manager.h"
 
@@ -23,17 +24,19 @@
 #define FILTER_TASK_PRIORITY       5U
 #define FILTER_QUEUE_LENGTH        8U
 #define TELEMETRY_JSON_SIZE        384U
+#define PENDING_RETRY_MS           1000U
 
 typedef struct {
     uint8_t segments[PUMP_TRANSACTION_DISPLAY_ROWS]
                     [PUMP_TRANSACTION_DISPLAY_COLUMNS];
 } pump_display_message_t;
 
-typedef struct {
-    uint32_t amount_vnd;
-    uint32_t volume_ml;
-    uint32_t unit_price;
-} pump_transaction_t;
+typedef pump_stored_transaction_t pump_transaction_t;
+
+typedef enum {
+    TRANSACTION_REPORT_DONE,
+    TRANSACTION_REPORT_RETRY,
+} transaction_report_result_t;
 
 static const char *TAG = "PUMP_FILTER";
 
@@ -160,7 +163,8 @@ static bool command_code_is_valid(const char *command_code)
 static esp_err_t publish_transaction_telemetry(
     const pump_transaction_t *transaction,
     const time_manager_snapshot_t *time_snapshot,
-    int8_t rssi)
+    int8_t rssi,
+    bool is_buffered)
 {
     if (transaction == NULL || time_snapshot == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -193,7 +197,7 @@ static esp_err_t publish_transaction_telemetry(
         cJSON_AddNumberToObject(data, "volume_ml", transaction->volume_ml) == NULL ||
         cJSON_AddStringToObject(data, "command_code", TRANSACTION_COMMAND_CODE) == NULL ||
         cJSON_AddStringToObject(data, "time_device", time_snapshot->time_device) == NULL ||
-        cJSON_AddBoolToObject(data, "is_buffered", false) == NULL ||
+        cJSON_AddBoolToObject(data, "is_buffered", is_buffered) == NULL ||
         cJSON_AddNumberToObject(data, "RSSI", rssi) == NULL) {
 
         cJSON_Delete(root);
@@ -214,14 +218,16 @@ static esp_err_t publish_transaction_telemetry(
     return mqtt_manager_publish_telemetry(json_payload);
 }
 
-static void report_completed_transaction(const pump_transaction_t *transaction)
+static transaction_report_result_t report_completed_transaction(
+    const pump_transaction_t *transaction,
+    bool is_buffered)
 {
     if (transaction == NULL ||
         transaction->unit_price == 0U ||
         transaction->amount_vnd == 0U ||
         transaction->volume_ml == 0U) {
         ESP_LOGE(TAG, "Du lieu giao dich khong hop le hoac bang 0");
-        return;
+        return TRANSACTION_REPORT_DONE;
     }
 
     float expected_amount_vnd =
@@ -246,12 +252,12 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
             (double)difference_vnd,
             (double)AMOUNT_TOLERANCE_VND
         );
-        return;
+        return TRANSACTION_REPORT_DONE;
     }
 
     if (!command_code_is_valid(TRANSACTION_COMMAND_CODE)) {
         ESP_LOGE(TAG, "command_code khong hop le");
-        return;
+        return TRANSACTION_REPORT_DONE;
     }
 
     time_manager_snapshot_t time_snapshot;
@@ -268,7 +274,7 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
             esp_err_to_name(time_result)
         );
         ESP_LOGI(TAG, "========================================");
-        return;
+        return TRANSACTION_REPORT_RETRY;
     }
 
     int8_t rssi;
@@ -279,18 +285,19 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
             "Giao dich hop le nhung khong lay duoc RSSI: %s",
             esp_err_to_name(rssi_result)
         );
-        return;
+        return TRANSACTION_REPORT_RETRY;
     }
 
     if (!mqtt_manager_is_ready()) {
         ESP_LOGW(TAG, "Giao dich hop le nhung MQTT chua ready, khong publish");
-        return;
+        return TRANSACTION_REPORT_RETRY;
     }
 
     esp_err_t publish_result = publish_transaction_telemetry(
         transaction,
         &time_snapshot,
-        rssi
+        rssi,
+        is_buffered
     );
     if (publish_result != ESP_OK) {
         ESP_LOGE(
@@ -298,7 +305,7 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
             "Publish MQTT telemetry that bai: %s",
             esp_err_to_name(publish_result)
         );
-        return;
+        return TRANSACTION_REPORT_RETRY;
     }
 
     ESP_LOGI(TAG, "========================================");
@@ -309,6 +316,7 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
     ESP_LOGI(TAG, "ts=%" PRId64, time_snapshot.ts);
     ESP_LOGI(TAG, "time_device=%s", time_snapshot.time_device);
     ESP_LOGI(TAG, "command_code=%s", TRANSACTION_COMMAND_CODE);
+    ESP_LOGI(TAG, "is_buffered=%s", is_buffered ? "true" : "false");
     ESP_LOGI(TAG, "RSSI=%d dBm", (int)rssi);
     ESP_LOGI(
         TAG,
@@ -318,6 +326,7 @@ static void report_completed_transaction(const pump_transaction_t *transaction)
         (double)AMOUNT_TOLERANCE_VND
     );
     ESP_LOGI(TAG, "========================================");
+    return TRANSACTION_REPORT_DONE;
 }
 
 static void pump_transaction_filter_task(void *argument)
@@ -328,14 +337,51 @@ static void pump_transaction_filter_task(void *argument)
     pump_transaction_t latest_transaction = {0};
     bool transaction_active = false;
     bool has_sale_data = false;
+    TickType_t last_display_tick = 0;
+    const TickType_t stable_ticks = pdMS_TO_TICKS(PUMP_DATA_STABLE_TIME_MS);
+    const TickType_t pending_retry_ticks = pdMS_TO_TICKS(PENDING_RETRY_MS);
 
     while (1) {
-        TickType_t wait_ticks =
-            transaction_active && has_sale_data
-                ? pdMS_TO_TICKS(PUMP_DATA_STABLE_TIME_MS)
-                : portMAX_DELAY;
+        while (pump_transaction_store_count() > 0U &&
+               time_manager_is_valid()) {
+            pump_transaction_t buffered_transaction;
+            esp_err_t store_result = pump_transaction_store_peek(
+                &buffered_transaction);
+            if (store_result != ESP_OK) {
+                ESP_LOGE(TAG, "Khong doc duoc giao dich Flash: %s",
+                         esp_err_to_name(store_result));
+                break;
+            }
+
+            if (report_completed_transaction(&buffered_transaction, true) !=
+                TRANSACTION_REPORT_DONE) {
+                break;
+            }
+
+            store_result = pump_transaction_store_pop();
+            if (store_result != ESP_OK) {
+                ESP_LOGE(TAG, "Khong xoa duoc giao dich da gui khoi Flash: %s",
+                         esp_err_to_name(store_result));
+                break;
+            }
+
+            ESP_LOGI(TAG, "Da gui giao dich Flash, con lai=%u",
+                     (unsigned)pump_transaction_store_count());
+        }
+
+        TickType_t wait_ticks = portMAX_DELAY;
+        if (transaction_active && has_sale_data) {
+            TickType_t elapsed = xTaskGetTickCount() - last_display_tick;
+            wait_ticks = elapsed >= stable_ticks ? 0 : stable_ticks - elapsed;
+        }
+
+        if (pump_transaction_store_count() > 0U &&
+            (wait_ticks == portMAX_DELAY || pending_retry_ticks < wait_ticks)) {
+            wait_ticks = pending_retry_ticks;
+        }
 
         if (xQueueReceive(s_display_queue, &message, wait_ticks) == pdTRUE) {
+            last_display_tick = xTaskGetTickCount();
             pump_transaction_t transaction = {0};
 
             if (!parse_transaction(&message, &transaction)) {
@@ -374,12 +420,32 @@ static void pump_transaction_filter_task(void *argument)
             continue;
         }
 
+        if (!transaction_active || !has_sale_data ||
+            (xTaskGetTickCount() - last_display_tick) < stable_ticks) {
+            continue;
+        }
+
         ESP_LOGI(
             TAG,
             "Du lieu bom da dung thay doi trong %u ms",
             (unsigned int)PUMP_DATA_STABLE_TIME_MS
         );
-        report_completed_transaction(&latest_transaction);
+        transaction_report_result_t report_result =
+            report_completed_transaction(&latest_transaction, false);
+        if (report_result == TRANSACTION_REPORT_RETRY) {
+            esp_err_t store_result = pump_transaction_store_append(
+                &latest_transaction);
+            if (store_result == ESP_OK) {
+                ESP_LOGI(
+                    TAG,
+                    "Da luu giao dich vao Flash, dang cho gui=%u",
+                    (unsigned)pump_transaction_store_count()
+                );
+            } else {
+                ESP_LOGE(TAG, "Khong luu duoc giao dich vao Flash: %s",
+                         esp_err_to_name(store_result));
+            }
+        }
 
         transaction_active = false;
         has_sale_data = false;
@@ -391,6 +457,11 @@ esp_err_t pump_transaction_filter_start(void)
 {
     if (s_started) {
         return ESP_OK;
+    }
+
+    esp_err_t store_result = pump_transaction_store_init();
+    if (store_result != ESP_OK) {
+        return store_result;
     }
 
     s_display_queue = xQueueCreate(

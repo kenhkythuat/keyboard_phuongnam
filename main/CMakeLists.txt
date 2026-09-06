@@ -4,6 +4,7 @@ idf_component_register(
         "mqtt_manager.c"
         "pump_data_sniffer.c"
         "pump_transaction_filter.c"
+        "pump_transaction_store.c"
         "time_manager.c"
         "main.c"
         "control_display_led.c"
