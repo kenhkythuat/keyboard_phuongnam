@@ -83,7 +83,7 @@ void control_display_led_set_segments(
  */
 #define ENABLE_BLANK_COLUMN1_FALLBACK  1
 #define BLANK_COLUMN1_TIMEOUT_US       1000000LL
-#define FILTER_COLUMN1_ROW2_ROW3_GHOST 1
+#define FILTER_COLUMN1_ROW2_ROW3_GHOST 0
 
 static int64_t s_column1_missing_since_us = 0;
 
@@ -435,8 +435,9 @@ static void evaluate_bit_offset(
          */
 #if FILTER_COLUMN1_ROW2_ROW3_GHOST
         /*
-         * Cot 1 tren man hinh nay chi dung hang 1; hang 2 va hang 3
-         * phai tat. Neu row2/row3 sang thi day thuong la ghost frame.
+         * Tuy chon legacy: chi dung khi phan cung chac chan khong bao gio
+         * hien thi COL1 tren row2/row3. Mac dinh tat de COL1 duoc giai ma
+         * giong nhu cac cot con lai.
          */
         if (column == 0U &&
             (row2 != 0x00U ||
@@ -1607,6 +1608,13 @@ bool mbi_sniffer_get_display(
     uint8_t output
         [DISPLAY_ROWS][DISPLAY_COLUMNS])
 {
+    return mbi_sniffer_get_display_snapshot(output, NULL);
+}
+
+bool mbi_sniffer_get_display_snapshot(
+    uint8_t output[DISPLAY_ROWS][DISPLAY_COLUMNS],
+    uint32_t *generation)
+{
     if (output == NULL) {
         return false;
     }
@@ -1624,6 +1632,10 @@ bool mbi_sniffer_get_display(
             s_latest_display.display,
             sizeof(s_latest_display.display)
         );
+    }
+
+    if (generation != NULL) {
+        *generation = s_display_generation;
     }
 
     portEXIT_CRITICAL(&s_shared_lock);

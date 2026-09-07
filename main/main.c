@@ -9,9 +9,12 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "device_settings.h"
 #include "pump_data_sniffer.h"
+#include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
 #include "time_manager.h"
+#include "virtual_key_output.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "KEY_OUTPUT";
@@ -228,6 +231,34 @@ static esp_err_t key_press(uint8_t key_code, uint32_t hold_time_ms)
     key_set_active(key_code);
     vTaskDelay(pdMS_TO_TICKS(hold_time_ms));
     key_set_active(KEY_NONE);
+
+    return ESP_OK;
+}
+
+esp_err_t virtual_key_output_run_sequence(const char *sequence,
+                                          uint32_t interval_ms)
+{
+    if (sequence == NULL || sequence[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t index = 0; sequence[index] != '\0'; index++) {
+        uint8_t key_code = key_code_from_char(sequence[index]);
+        if (key_code == KEY_NONE) {
+            ESP_LOGE(TAG, "Ky tu phim ao khong ho tro: %c", sequence[index]);
+            key_set_active(KEY_NONE);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        esp_err_t err = key_press(key_code, AUTO_KEY_HOLD_TIME_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (sequence[index + 1U] != '\0') {
+            vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        }
+    }
 
     return ESP_OK;
 }
@@ -463,7 +494,13 @@ static void keypad_scan_task(void *argument)
             stable_mask = sample_mask;
 
 #if COMBINES_KEYPAD_FUNTIONS
-            key_set_active(keypad_get_first_key(stable_mask));
+            uint8_t physical_key = keypad_get_first_key(stable_mask);
+            if (physical_key == KEY_HASH &&
+                device_settings_is_hash_key_locked()) {
+                ESP_LOGW(TAG, "Phim # vat ly dang bi khoa, bo qua lan nhan");
+                physical_key = KEY_NONE;
+            }
+            key_set_active(physical_key);
 #endif
         }
 
@@ -480,6 +517,12 @@ void app_main(void)
     esp_err_t wifi_result = wifi_manager_start();
     if (wifi_result != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    }
+
+    esp_err_t settings_result = device_settings_init();
+    if (settings_result != ESP_OK) {
+        ESP_LOGE(TAG, "Device settings init failed: %s",
+                 esp_err_to_name(settings_result));
     }
 
     esp_err_t time_result = time_manager_start();
@@ -503,6 +546,12 @@ void app_main(void)
     key_release();
     ESP_LOGI(TAG, "Combine keypad functions enabled");
 #endif
+
+    esp_err_t command_result = mqtt_command_handler_start();
+    if (command_result != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT command handler init failed: %s",
+                 esp_err_to_name(command_result));
+    }
 
 #if ENABLE_AUTO_KEY_SEQUENCE
     auto_key_sequence_start();
@@ -548,6 +597,12 @@ void app_main(void)
         ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
     }
 
+    esp_err_t settings_result = device_settings_init();
+    if (settings_result != ESP_OK) {
+        ESP_LOGE(TAG, "Device settings init failed: %s",
+                 esp_err_to_name(settings_result));
+    }
+
     esp_err_t time_result = time_manager_start();
     if (time_result != ESP_OK) {
         ESP_LOGE(TAG, "Time manager init failed: %s", esp_err_to_name(time_result));
@@ -564,6 +619,12 @@ void app_main(void)
 
     key_gpio_init();
     key_release();
+
+    esp_err_t command_result = mqtt_command_handler_start();
+    if (command_result != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT command handler init failed: %s",
+                 esp_err_to_name(command_result));
+    }
 
 #if ENABLE_AUTO_KEY_SEQUENCE
     auto_key_sequence_start();

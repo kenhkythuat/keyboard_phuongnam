@@ -10,3 +10,7 @@ void pump_data_sniffer_start(void);
 
 bool mbi_sniffer_get_display(
     uint8_t output[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS]);
+
+bool mbi_sniffer_get_display_snapshot(
+    uint8_t output[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
+    uint32_t *generation);
