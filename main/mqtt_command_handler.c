@@ -28,12 +28,15 @@
 #define REQUEST_ID_MAX_LENGTH       64U
 #define COMMAND_NAME_MAX_LENGTH     48U
 #define DEDUP_HISTORY_LENGTH        16U
-#define SET_UNIT_PRICE_KEY_INTERVAL_MS 500U
+#define VIRTUAL_KEY_INTERVAL_MS     500U
 #define SET_UNIT_PRICE_MAX          999999U
 #define SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH 24U
 #define SET_UNIT_PRICE_MAX_ATTEMPTS  3U
 #define SET_UNIT_PRICE_VERIFY_TIMEOUT_MS 3000U
 #define SET_UNIT_PRICE_VERIFY_POLL_MS 50U
+#define TOTALIZER_MAX_ATTEMPTS      3U
+#define TOTALIZER_VERIFY_TIMEOUT_MS 3000U
+#define TOTALIZER_TELEMETRY_JSON_SIZE 256U
 
 typedef struct {
     size_t length;
@@ -167,6 +170,242 @@ static bool wait_for_unit_price_confirmation(uint32_t expected_unit_price,
     return false;
 }
 
+static bool decode_unsigned_row(const uint8_t row[PUMP_DATA_DISPLAY_COLUMNS],
+                                uint64_t *value)
+{
+    uint64_t decoded = 0U;
+    bool found_digit = false;
+    for (size_t column = 0; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
+        uint8_t digit;
+        bool blank;
+        if (!segment_to_digit(row[column], &digit, &blank)) {
+            return false;
+        }
+        if (!blank) {
+            found_digit = true;
+            decoded = decoded * 10U + digit;
+        }
+    }
+    if (!found_digit) {
+        return false;
+    }
+    *value = decoded;
+    return true;
+}
+
+static bool decode_total_amount_display(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
+    uint64_t *total_amount_vnd)
+{
+    for (size_t column = 0; column < 3U; column++) {
+        if ((display[0][column] & 0x7FU) != 0x00U) {
+            return false;
+        }
+    }
+    if ((display[0][3] & 0x7FU) != 0x73U ||
+        (display[0][4] & 0x7FU) != 0x5BU ||
+        (display[0][5] & 0x7FU) != 0x3FU) {
+        return false;
+    }
+    return decode_unsigned_row(display[1], total_amount_vnd);
+}
+
+static bool decode_total_volume_display(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
+    double *total_volume_l)
+{
+    uint64_t integer_part;
+    if (!decode_unsigned_row(display[0], &integer_part)) {
+        return false;
+    }
+
+    bool decimal_marker_found = false;
+    bool fractional_digit_found = false;
+    uint64_t fractional_part = 0U;
+    uint64_t fractional_scale = 1U;
+
+    for (size_t column = 0; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
+        uint8_t segments = display[1][column];
+        if ((segments & 0x80U) != 0U) {
+            if (decimal_marker_found) {
+                break;
+            }
+            decimal_marker_found = true;
+        }
+
+        if (!decimal_marker_found) {
+            continue;
+        }
+
+        uint8_t digit;
+        bool blank;
+        if (!segment_to_digit(segments, &digit, &blank)) {
+            return false;
+        }
+        if (!blank) {
+            fractional_digit_found = true;
+            fractional_part = fractional_part * 10U + digit;
+            fractional_scale *= 10U;
+        }
+    }
+
+    if (!decimal_marker_found || !fractional_digit_found) {
+        return false;
+    }
+
+    *total_volume_l = (double)integer_part +
+                      ((double)fractional_part / (double)fractional_scale);
+    return true;
+}
+
+static bool wait_for_total_amount(uint32_t baseline_generation,
+                                  uint64_t *total_amount_vnd)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            decode_total_amount_display(display, total_amount_vnd)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static bool wait_for_total_volume(uint32_t baseline_generation,
+                                  double *total_volume_l)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            decode_total_volume_display(display, total_volume_l)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
+{
+    for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGI(TAG, "Doc tong tien lan %u/%u",
+                 (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
+        esp_err_t err = virtual_key_output_run_sequence(
+            "C#7733", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t baseline_generation = 0U;
+        (void)mbi_sniffer_get_display_snapshot(display, &baseline_generation);
+        err = virtual_key_output_run_sequence("E", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (wait_for_total_amount(baseline_generation, total_amount_vnd)) {
+            ESP_LOGI(TAG, "Doc tong tien thanh cong: %" PRIu64 " VND",
+                     *total_amount_vnd);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            return virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        }
+
+        ESP_LOGW(TAG, "Khong tim thay P20/tong tien hop le lan %u",
+                 (unsigned)attempt);
+        (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
+static esp_err_t read_total_volume(double *total_volume_l)
+{
+    for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGI(TAG, "Doc tong lit lan %u/%u",
+                 (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
+        esp_err_t err = virtual_key_output_run_sequence(
+            "C#44504E", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t baseline_generation = 0U;
+        (void)mbi_sniffer_get_display_snapshot(display, &baseline_generation);
+        err = virtual_key_output_run_sequence("T", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (wait_for_total_volume(baseline_generation, total_volume_l)) {
+            ESP_LOGI(TAG, "Doc tong lit thanh cong: %.3f L", *total_volume_l);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            return virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        }
+
+        ESP_LOGW(TAG, "Khong decode duoc tong lit lan %u", (unsigned)attempt);
+        (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
+static esp_err_t publish_totalizer_telemetry(uint64_t total_amount_vnd,
+                                             double total_volume_l)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool built =
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version", "1.3") != NULL;
+    bool data_attached = built && cJSON_AddItemToObject(root, "data", data);
+    built = data_attached &&
+        cJSON_AddNumberToObject(data, "total_amount_vnd",
+                               (double)total_amount_vnd) != NULL &&
+        cJSON_AddNumberToObject(data, "total_volume_l", total_volume_l) != NULL &&
+        cJSON_AddStringToObject(data, "time_device",
+                               snapshot.time_device) != NULL;
+    if (!built) {
+        if (!data_attached) {
+            cJSON_Delete(data);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char payload[TOTALIZER_TELEMETRY_JSON_SIZE];
+    if (!cJSON_PrintPreallocated(root, payload, sizeof(payload), false)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON_Delete(root);
+    return mqtt_manager_publish_telemetry(payload);
+}
+
 static esp_err_t execute_set_unit_price(uint32_t unit_price)
 {
     char entry_sequence[SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH];
@@ -183,18 +422,18 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
                  entry_sequence);
 
         esp_err_t err = virtual_key_output_run_sequence(
-            entry_sequence, SET_UNIT_PRICE_KEY_INTERVAL_MS);
+            entry_sequence, VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_KEY_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
         uint8_t current_display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
         uint32_t baseline_generation = 0U;
         (void)mbi_sniffer_get_display_snapshot(current_display,
                                                &baseline_generation);
 
-        err = virtual_key_output_run_sequence("E", SET_UNIT_PRICE_KEY_INTERVAL_MS);
+        err = virtual_key_output_run_sequence("E", VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
@@ -202,9 +441,9 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
         if (wait_for_unit_price_confirmation(unit_price, baseline_generation)) {
             ESP_LOGI(TAG, "Xac nhan man hinh E0 va unit_price=%" PRIu32,
                      unit_price);
-            vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_KEY_INTERVAL_MS));
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
             return virtual_key_output_run_sequence(
-                "C", SET_UNIT_PRICE_KEY_INTERVAL_MS);
+                "C", VIRTUAL_KEY_INTERVAL_MS);
         }
 
         ESP_LOGW(TAG, "Khong xac nhan duoc E0/unit_price=%" PRIu32
@@ -222,7 +461,10 @@ static esp_err_t publish_ack(const char *request_id,
                              bool report_unit_price,
                              uint32_t unit_price,
                              bool report_hash_key_locked,
-                             bool hash_key_locked)
+                             bool hash_key_locked,
+                             bool report_totalizer,
+                             uint64_t total_amount_vnd,
+                             double total_volume_l)
 {
     time_manager_snapshot_t snapshot;
     esp_err_t err = time_manager_get_snapshot(&snapshot);
@@ -248,6 +490,16 @@ static esp_err_t publish_ack(const char *request_id,
     if (report_hash_key_locked &&
         cJSON_AddBoolToObject(reported, "hash_key_locked",
                               hash_key_locked) == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (report_totalizer &&
+        (cJSON_AddNumberToObject(reported, "total_amount_vnd",
+                                 (double)total_amount_vnd) == NULL ||
+         cJSON_AddNumberToObject(reported, "total_volume_l",
+                                 total_volume_l) == NULL)) {
         cJSON_Delete(root);
         cJSON_Delete(reported);
         return ESP_ERR_NO_MEM;
@@ -311,7 +563,8 @@ static void process_command(const command_message_t *message)
     if (request_was_processed(request_id->valuestring)) {
         esp_err_t err = publish_ack(request_id->valuestring, command->valuestring,
                                     "rejected", "duplicate_request",
-                                    false, 0U, false, false);
+                                    false, 0U, false, false,
+                                    false, 0U, 0.0);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Gui duplicate ACK that bai: %s", esp_err_to_name(err));
         }
@@ -337,7 +590,8 @@ static void process_command(const command_message_t *message)
         if (!cJSON_IsBool(locked_item)) {
             esp_err_t err = publish_ack(
                 request_id->valuestring, command->valuestring,
-                "error", "invalid_param", false, 0U, false, false);
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
             if (err == ESP_OK) {
                 remember_request(request_id->valuestring);
             } else {
@@ -367,12 +621,75 @@ static void process_command(const command_message_t *message)
 
         esp_err_t ack_err = publish_ack(
             request_id->valuestring, command->valuestring,
-            result, description, false, 0U, true, actual_locked);
+            result, description, false, 0U, true, actual_locked,
+            false, 0U, 0.0);
         if (ack_err == ESP_OK) {
             remember_request(request_id->valuestring);
         } else {
             ESP_LOGE(TAG, "Publish ACK set_hash_key_lock that bai: %s",
                      esp_err_to_name(ack_err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (envelope_valid && strcmp(command->valuestring, "get_totalizer") == 0) {
+        if (cJSON_GetArraySize(param) != 0) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint64_t total_amount_vnd = 0U;
+        double total_volume_l = 0.0;
+        esp_err_t err = read_total_amount(&total_amount_vnd);
+        if (err == ESP_OK) {
+            err = read_total_volume(&total_volume_l);
+        }
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "GET_TOTALIZER THAT BAI: %s", esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "verification_failed", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err != ESP_OK) {
+                ESP_LOGE(TAG, "Publish ACK loi get_totalizer that bai: %s",
+                         esp_err_to_name(ack_err));
+            } else {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_ack(
+            request_id->valuestring, command->valuestring,
+            "ok", "totalizer_read_success",
+            false, 0U, false, false,
+            true, total_amount_vnd, total_volume_l);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Publish ACK totalizer that bai: %s",
+                     esp_err_to_name(err));
+            cJSON_Delete(root);
+            return;
+        }
+        remember_request(request_id->valuestring);
+
+        err = publish_totalizer_telemetry(total_amount_vnd, total_volume_l);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Publish totalizer telemetry that bai: %s",
+                     esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Totalizer telemetry queued: amount=%" PRIu64
+                          " VND volume=%.3f L",
+                     total_amount_vnd, total_volume_l);
         }
         cJSON_Delete(root);
         return;
@@ -389,7 +706,8 @@ static void process_command(const command_message_t *message)
         if (!unit_price_valid) {
             esp_err_t err = publish_ack(
                 request_id->valuestring, command->valuestring,
-                "error", "invalid_param", false, 0U, false, false);
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
             if (err == ESP_OK) {
                 remember_request(request_id->valuestring);
             } else {
@@ -402,7 +720,8 @@ static void process_command(const command_message_t *message)
         uint32_t unit_price = (uint32_t)unit_price_item->valuedouble;
         esp_err_t err = publish_ack(
             request_id->valuestring, command->valuestring,
-            "ok", "unit_price_accepted", true, unit_price, false, false);
+            "ok", "unit_price_accepted", true, unit_price, false, false,
+            false, 0U, 0.0);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Publish ACK set_unit_price that bai: %s",
                      esp_err_to_name(err));
@@ -415,7 +734,7 @@ static void process_command(const command_message_t *message)
         ESP_LOGI(TAG, "Thuc thi set_unit_price=%" PRIu32
                       ", interval=%u ms, max_attempts=%u",
                  unit_price,
-                 (unsigned)SET_UNIT_PRICE_KEY_INTERVAL_MS,
+                 (unsigned)VIRTUAL_KEY_INTERVAL_MS,
                  (unsigned)SET_UNIT_PRICE_MAX_ATTEMPTS);
         err = execute_set_unit_price(unit_price);
         if (err != ESP_OK) {
@@ -439,7 +758,8 @@ static void process_command(const command_message_t *message)
     }
     esp_err_t err = publish_ack(request_id->valuestring, command->valuestring,
                                 result, description,
-                                false, 0U, false, false);
+                                false, 0U, false, false,
+                                false, 0U, 0.0);
     if (err == ESP_OK) {
         remember_request(request_id->valuestring);
     } else {

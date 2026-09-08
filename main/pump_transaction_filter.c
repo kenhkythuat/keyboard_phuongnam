@@ -78,7 +78,8 @@ static bool parse_display_row(
     const uint8_t display[PUMP_TRANSACTION_DISPLAY_ROWS]
                          [PUMP_TRANSACTION_DISPLAY_COLUMNS],
     uint8_t row,
-    uint32_t *value)
+    uint32_t *value,
+    bool log_invalid_data)
 {
     uint32_t parsed_value = 0;
     bool found_digit = false;
@@ -92,13 +93,15 @@ static bool parse_display_row(
         uint8_t segments = display[row][column];
 
         if (!segment_to_digit(segments, &digit, &blank)) {
-            ESP_LOGE(
-                TAG,
-                "Ky tu la tai ROW_%u COL_%u: segment=0x%02X, chi chap nhan 0-9",
-                (unsigned int)(row + 1U),
-                (unsigned int)(column + 1U),
-                segments
-            );
+            if (log_invalid_data) {
+                ESP_LOGE(
+                    TAG,
+                    "Ky tu la tai ROW_%u COL_%u: segment=0x%02X, chi chap nhan 0-9",
+                    (unsigned int)(row + 1U),
+                    (unsigned int)(column + 1U),
+                    segments
+                );
+            }
             return false;
         }
 
@@ -111,7 +114,10 @@ static bool parse_display_row(
     }
 
     if (!found_digit) {
-        ESP_LOGE(TAG, "ROW_%u khong co chu so", (unsigned int)(row + 1U));
+        if (log_invalid_data) {
+            ESP_LOGE(TAG, "ROW_%u khong co chu so",
+                     (unsigned int)(row + 1U));
+        }
         return false;
     }
 
@@ -121,15 +127,19 @@ static bool parse_display_row(
 
 static bool parse_transaction(
     const pump_display_message_t *message,
-    pump_transaction_t *transaction)
+    pump_transaction_t *transaction,
+    bool log_invalid_data)
 {
     if (message == NULL || transaction == NULL) {
         return false;
     }
 
-    return parse_display_row(message->segments, 0, &transaction->amount_vnd) &&
-           parse_display_row(message->segments, 1, &transaction->volume_ml) &&
-           parse_display_row(message->segments, 2, &transaction->unit_price);
+    return parse_display_row(message->segments, 0,
+                             &transaction->amount_vnd, log_invalid_data) &&
+           parse_display_row(message->segments, 1,
+                             &transaction->volume_ml, log_invalid_data) &&
+           parse_display_row(message->segments, 2,
+                             &transaction->unit_price, log_invalid_data);
 }
 
 static bool command_code_is_valid(const char *command_code)
@@ -335,8 +345,11 @@ static void pump_transaction_filter_task(void *argument)
 
     pump_display_message_t message;
     pump_transaction_t latest_transaction = {0};
+    pump_transaction_t previous_positive_transaction = {0};
     bool transaction_active = false;
     bool has_sale_data = false;
+    bool has_positive_sample = false;
+    bool progressive_increase_seen = false;
     TickType_t last_display_tick = 0;
     const TickType_t stable_ticks = pdMS_TO_TICKS(PUMP_DATA_STABLE_TIME_MS);
     const TickType_t pending_retry_ticks = pdMS_TO_TICKS(PENDING_RETRY_MS);
@@ -384,7 +397,8 @@ static void pump_transaction_filter_task(void *argument)
             last_display_tick = xTaskGetTickCount();
             pump_transaction_t transaction = {0};
 
-            if (!parse_transaction(&message, &transaction)) {
+            if (!parse_transaction(&message, &transaction,
+                                   transaction_active)) {
                 if (transaction_active) {
                     has_sale_data = false;
                 }
@@ -399,7 +413,11 @@ static void pump_transaction_filter_task(void *argument)
             if (is_transaction_start) {
                 transaction_active = true;
                 has_sale_data = false;
+                has_positive_sample = false;
+                progressive_increase_seen = false;
                 latest_transaction = transaction;
+                memset(&previous_positive_transaction, 0,
+                       sizeof(previous_positive_transaction));
 
                 ESP_LOGI(
                     TAG,
@@ -413,10 +431,70 @@ static void pump_transaction_filter_task(void *argument)
                 continue;
             }
 
-            latest_transaction = transaction;
-            has_sale_data =
+            bool positive_values =
                 transaction.amount_vnd > 0U &&
                 transaction.volume_ml > 0U;
+            if (!positive_values) {
+                has_sale_data = false;
+                continue;
+            }
+
+            if (!has_positive_sample) {
+                previous_positive_transaction = transaction;
+                latest_transaction = transaction;
+                has_positive_sample = true;
+                has_sale_data = false;
+                ESP_LOGI(
+                    TAG,
+                    "Nhan mau bom duong dau tien: amount=%" PRIu32
+                    " volume=%" PRIu32 ", cho buoc tang tiep theo",
+                    transaction.amount_vnd,
+                    transaction.volume_ml
+                );
+                continue;
+            }
+
+            bool same_unit_price =
+                transaction.unit_price ==
+                previous_positive_transaction.unit_price;
+            bool non_decreasing =
+                transaction.amount_vnd >=
+                    previous_positive_transaction.amount_vnd &&
+                transaction.volume_ml >=
+                    previous_positive_transaction.volume_ml;
+            bool increased =
+                transaction.amount_vnd >
+                    previous_positive_transaction.amount_vnd ||
+                transaction.volume_ml >
+                    previous_positive_transaction.volume_ml;
+
+            if (same_unit_price && non_decreasing && increased) {
+                if (!progressive_increase_seen) {
+                    ESP_LOGI(
+                        TAG,
+                        "Da xac nhan du lieu bom tang dan: amount=%" PRIu32
+                        " -> %" PRIu32 ", volume=%" PRIu32 " -> %" PRIu32,
+                        previous_positive_transaction.amount_vnd,
+                        transaction.amount_vnd,
+                        previous_positive_transaction.volume_ml,
+                        transaction.volume_ml
+                    );
+                }
+                progressive_increase_seen = true;
+            } else if (!same_unit_price || !non_decreasing) {
+                ESP_LOGW(
+                    TAG,
+                    "Du lieu bom khong tang dan, dat lai baseline: "
+                    "amount=%" PRIu32 " volume=%" PRIu32,
+                    transaction.amount_vnd,
+                    transaction.volume_ml
+                );
+                progressive_increase_seen = false;
+            }
+
+            previous_positive_transaction = transaction;
+            latest_transaction = transaction;
+            has_sale_data = progressive_increase_seen;
             continue;
         }
 
@@ -449,7 +527,11 @@ static void pump_transaction_filter_task(void *argument)
 
         transaction_active = false;
         has_sale_data = false;
+        has_positive_sample = false;
+        progressive_increase_seen = false;
         memset(&latest_transaction, 0, sizeof(latest_transaction));
+        memset(&previous_positive_transaction, 0,
+               sizeof(previous_positive_transaction));
     }
 }
 
