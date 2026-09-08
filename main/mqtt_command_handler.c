@@ -36,6 +36,7 @@
 #define SET_UNIT_PRICE_VERIFY_POLL_MS 50U
 #define TOTALIZER_MAX_ATTEMPTS      3U
 #define TOTALIZER_VERIFY_TIMEOUT_MS 3000U
+#define TOTALIZER_DISPLAY_SETTLE_MS 1000U
 #define TOTALIZER_TELEMETRY_JSON_SIZE 256U
 
 typedef struct {
@@ -121,17 +122,23 @@ static bool segment_to_digit(uint8_t segments, uint8_t *digit, bool *blank)
     }
 }
 
-static bool display_confirms_unit_price(
-    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
-    uint32_t expected_unit_price)
+static bool display_has_e0(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS])
 {
     for (size_t column = 0; column < 4U; column++) {
         if ((display[0][column] & 0x7FU) != 0x00U) {
             return false;
         }
     }
-    if ((display[0][4] & 0x7FU) != 0x79U ||
-        (display[0][5] & 0x7FU) != 0x3FU) {
+    return (display[0][4] & 0x7FU) == 0x79U &&
+           (display[0][5] & 0x7FU) == 0x3FU;
+}
+
+static bool display_confirms_unit_price(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
+    uint32_t expected_unit_price)
+{
+    if (!display_has_e0(display)) {
         return false;
     }
 
@@ -208,6 +215,23 @@ static bool decode_total_amount_display(
         return false;
     }
     return decode_unsigned_row(display[1], total_amount_vnd);
+}
+
+static bool decode_reset_total_volume_display(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS],
+    uint64_t *displayed_total_volume)
+{
+    for (size_t column = 0; column < 3U; column++) {
+        if ((display[0][column] & 0x7FU) != 0x00U) {
+            return false;
+        }
+    }
+    if ((display[0][3] & 0x7FU) != 0x73U ||
+        (display[0][4] & 0x7FU) != 0x3FU ||
+        (display[0][5] & 0x7FU) != 0x7FU) {
+        return false;
+    }
+    return decode_unsigned_row(display[1], displayed_total_volume);
 }
 
 static bool decode_total_volume_display(
@@ -294,6 +318,72 @@ static bool wait_for_total_volume(uint32_t baseline_generation,
     return false;
 }
 
+static bool wait_for_e0(uint32_t baseline_generation)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            display_has_e0(display)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static bool wait_for_reset_total_volume_screen(uint32_t baseline_generation)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        uint64_t displayed_total_volume = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            decode_reset_total_volume_display(display,
+                                              &displayed_total_volume)) {
+            ESP_LOGI(TAG, "Da vao P08, tong lit hien thi=%" PRIu64,
+                     displayed_total_volume);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static bool wait_for_display_row_zero(uint32_t baseline_generation,
+                                      size_t row)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        uint64_t value = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            row < PUMP_DATA_DISPLAY_ROWS &&
+            decode_unsigned_row(display[row], &value) && value == 0U) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static uint32_t get_display_generation(void)
+{
+    uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+    uint32_t generation = 0U;
+    (void)mbi_sniffer_get_display_snapshot(display, &generation);
+    return generation;
+}
+
 static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
 {
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
@@ -334,20 +424,15 @@ static esp_err_t read_total_volume(double *total_volume_l)
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Doc tong lit lan %u/%u",
                  (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
+
+        uint32_t baseline_generation = get_display_generation();
         esp_err_t err = virtual_key_output_run_sequence(
-            "C#44504E", VIRTUAL_KEY_INTERVAL_MS);
+            "C#44504ET", VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
-        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
-        uint32_t baseline_generation = 0U;
-        (void)mbi_sniffer_get_display_snapshot(display, &baseline_generation);
-        err = virtual_key_output_run_sequence("T", VIRTUAL_KEY_INTERVAL_MS);
-        if (err != ESP_OK) {
-            return err;
-        }
+        vTaskDelay(pdMS_TO_TICKS(TOTALIZER_DISPLAY_SETTLE_MS));
 
         if (wait_for_total_volume(baseline_generation, total_volume_l)) {
             ESP_LOGI(TAG, "Doc tong lit thanh cong: %.3f L", *total_volume_l);
@@ -356,6 +441,114 @@ static esp_err_t read_total_volume(double *total_volume_l)
         }
 
         ESP_LOGW(TAG, "Khong decode duoc tong lit lan %u", (unsigned)attempt);
+        (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
+static esp_err_t reset_total_amount(void)
+{
+    for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGI(TAG, "Reset tong tien lan %u/%u",
+                 (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
+
+        esp_err_t err = virtual_key_output_run_sequence(
+            "C#7733", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+
+        uint32_t baseline_generation = get_display_generation();
+        err = virtual_key_output_run_sequence("E", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        uint64_t current_total = 0U;
+        if (!wait_for_total_amount(baseline_generation, &current_total)) {
+            ESP_LOGW(TAG, "Reset tong tien: khong tim thay P20 lan %u",
+                     (unsigned)attempt);
+            (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Da vao P20, tong tien hien tai=%" PRIu64, current_total);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+        baseline_generation = get_display_generation();
+        err = virtual_key_output_run_sequence("000", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (wait_for_e0(baseline_generation)) {
+            ESP_LOGI(TAG, "Reset tong tien da xac nhan E0");
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            return virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        }
+
+        ESP_LOGW(TAG, "Reset tong tien: khong thay E0 lan %u",
+                 (unsigned)attempt);
+        (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
+static esp_err_t reset_total_volume(void)
+{
+    for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
+        ESP_LOGI(TAG, "Reset tong lit lan %u/%u",
+                 (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
+
+        uint32_t baseline_generation = get_display_generation();
+        esp_err_t err = virtual_key_output_run_sequence(
+            "C#845443E", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (!wait_for_reset_total_volume_screen(baseline_generation)) {
+            ESP_LOGW(TAG, "Reset tong lit: khong thay P08 lan %u",
+                     (unsigned)attempt);
+            (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+        baseline_generation = get_display_generation();
+        err = virtual_key_output_run_sequence("0", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (!wait_for_display_row_zero(baseline_generation, 1U)) {
+            ESP_LOGW(TAG, "Reset tong lit: hang 2 chua ve 0 lan %u",
+                     (unsigned)attempt);
+            (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Reset tong lit: hang 2 da ve 0");
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+        baseline_generation = get_display_generation();
+        err = virtual_key_output_run_sequence("E", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        if (wait_for_e0(baseline_generation)) {
+            ESP_LOGI(TAG, "Reset tong lit da xac nhan E0");
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            return virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        }
+
+        ESP_LOGW(TAG, "Reset tong lit: khong thay E0 sau phim E lan %u",
+                 (unsigned)attempt);
         (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
         vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
     }
@@ -582,6 +775,73 @@ static void process_command(const command_message_t *message)
                           cJSON_IsString(version) &&
                           strcmp(version->valuestring, "1.3") == 0 &&
                           cJSON_IsObject(param);
+    bool reset_totalizer_envelope_valid =
+        (timestamp == NULL || timestamp_valid) &&
+        cJSON_IsString(version) &&
+        strcmp(version->valuestring, "1.3") == 0 &&
+        cJSON_IsObject(param);
+
+    if (strcmp(command->valuestring, "reset_totalizer") == 0) {
+        const cJSON *confirm = cJSON_IsObject(param)
+                                   ? cJSON_GetObjectItemCaseSensitive(param,
+                                                                      "confirm")
+                                   : NULL;
+        bool param_valid = reset_totalizer_envelope_valid &&
+                           cJSON_IsTrue(confirm) &&
+                           cJSON_GetArraySize(param) == 1;
+        if (!param_valid) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param",
+                false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK reset_totalizer invalid_param that bai: %s",
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        esp_err_t err = reset_total_amount();
+        if (err == ESP_OK) {
+            err = reset_total_volume();
+        }
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "RESET_TOTALIZER THAT BAI: %s", esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "verification_failed",
+                false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK loi reset_totalizer that bai: %s",
+                         esp_err_to_name(ack_err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_ack(
+            request_id->valuestring, command->valuestring,
+            "ok", "totalizer_reset",
+            false, 0U, false, false,
+            true, 0U, 0.0);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+            ESP_LOGI(TAG, "Reset totalizer hoan tat va da ACK");
+        } else {
+            ESP_LOGE(TAG, "Publish ACK reset_totalizer that bai: %s",
+                     esp_err_to_name(err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
 
     if (envelope_valid &&
         strcmp(command->valuestring, "set_hash_key_lock") == 0) {

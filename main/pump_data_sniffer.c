@@ -179,6 +179,7 @@ static uint8_t s_latest_oe_level = 0;
 static uint8_t s_latest_assembly_mask = 0;
 
 static uint32_t s_display_generation = 0;
+static uint32_t s_display_observation_generation = 0;
 
 static mbi_decode_result_t s_latest_candidate;
 static mbi_decode_result_t s_latest_display;
@@ -1140,6 +1141,8 @@ static void process_capture_sample(
         s_assembly_confirmed_mask;
 
     if (display_completed) {
+        s_display_observation_generation++;
+
         bool first_display =
             s_display_generation == 0U;
 
@@ -1635,7 +1638,7 @@ bool mbi_sniffer_get_display_snapshot(
     }
 
     if (generation != NULL) {
-        *generation = s_display_generation;
+        *generation = s_display_observation_generation;
     }
 
     portEXIT_CRITICAL(&s_shared_lock);
