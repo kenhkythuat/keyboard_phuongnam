@@ -735,6 +735,79 @@ static esp_err_t publish_ack(const char *request_id,
     return err;
 }
 
+static esp_err_t publish_shortcut_mapping_ack(
+    const char *request_id,
+    const shortcut_mapping_t *mapping,
+    uint32_t revision)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    cJSON *mapping_json = cJSON_CreateObject();
+    if (root == NULL || reported == NULL || mapping_json == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        cJSON_Delete(mapping_json);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool mapping_built =
+        cJSON_AddStringToObject(mapping_json, "physical_key",
+                               mapping->physical_key) != NULL &&
+        cJSON_AddStringToObject(mapping_json, "shortcut_key",
+                               mapping->shortcut_key) != NULL;
+    bool mapping_attached = mapping_built &&
+                            cJSON_AddItemToObject(reported, "mapping",
+                                                  mapping_json);
+    bool reported_built = mapping_attached &&
+                          cJSON_AddNumberToObject(reported, "revision",
+                                                 revision) != NULL;
+    bool root_built = reported_built &&
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "ack_to",
+                               "set_shortcut_mapping") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL &&
+        cJSON_AddStringToObject(root, "description",
+                               "shortcut_mapping_updated") != NULL;
+    bool reported_attached = root_built &&
+                             cJSON_AddItemToObject(root, "reported", reported);
+    bool built = reported_attached &&
+                 cJSON_AddStringToObject(root, "time_device",
+                                         snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        if (!mapping_attached) {
+            cJSON_Delete(mapping_json);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = mqtt_manager_publish_ack(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ACK shortcut queued: result=ok "
+                      "description=shortcut_mapping_updated "
+                      "%s -> %s revision=%" PRIu32,
+                 mapping->shortcut_key, mapping->physical_key, revision);
+    }
+    cJSON_free(payload);
+    return err;
+}
+
 static void process_command(const command_message_t *message)
 {
     cJSON *root = cJSON_ParseWithLength(message->payload, message->length);
@@ -780,6 +853,87 @@ static void process_command(const command_message_t *message)
         cJSON_IsString(version) &&
         strcmp(version->valuestring, "1.3") == 0 &&
         cJSON_IsObject(param);
+
+    if (strcmp(command->valuestring, "set_shortcut_mapping") == 0) {
+        const cJSON *physical_key = cJSON_IsObject(param)
+            ? cJSON_GetObjectItemCaseSensitive(param, "physical_key") : NULL;
+        const cJSON *shortcut_key = cJSON_IsObject(param)
+            ? cJSON_GetObjectItemCaseSensitive(param, "shortcut_key") : NULL;
+        bool param_valid = envelope_valid &&
+            cJSON_GetArraySize(param) == 2 &&
+            string_field_is_valid(physical_key,
+                                  SHORTCUT_PHYSICAL_KEY_MAX_LENGTH) &&
+            string_field_is_valid(shortcut_key, SHORTCUT_KEY_MAX_LENGTH) &&
+            device_settings_shortcut_mapping_is_valid(
+                shortcut_key->valuestring, physical_key->valuestring);
+        if (!param_valid) {
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint32_t revision = 0U;
+        esp_err_t err = device_settings_set_shortcut_mapping(
+            shortcut_key->valuestring, physical_key->valuestring, &revision);
+        shortcut_mapping_t readback = {0};
+        uint32_t readback_revision = 0U;
+        if (err == ESP_OK) {
+            err = device_settings_get_shortcut_mapping(
+                shortcut_key->valuestring, &readback, &readback_revision);
+            if (err == ESP_OK &&
+                (strcmp(readback.shortcut_key,
+                        shortcut_key->valuestring) != 0 ||
+                 strcmp(readback.physical_key,
+                        physical_key->valuestring) != 0 ||
+                 readback_revision != revision)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+
+        if (err != ESP_OK) {
+            const char *description;
+            if (err == ESP_ERR_NO_MEM) {
+                description = "mapping_limit_reached";
+            } else if (err == ESP_ERR_INVALID_RESPONSE ||
+                       err == ESP_ERR_NOT_FOUND) {
+                description = "reported_mismatch";
+            } else if (err == ESP_ERR_INVALID_ARG) {
+                description = "invalid_param";
+            } else if (err == ESP_ERR_INVALID_STATE) {
+                description = "internal_error";
+            } else {
+                description = "storage_error";
+            }
+            ESP_LOGE(TAG, "Cap nhat shortcut mapping that bai: %s",
+                     esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", description, false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_shortcut_mapping_ack(request_id->valuestring,
+                                           &readback, readback_revision);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK shortcut mapping that bai: %s",
+                     esp_err_to_name(err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
 
     if (strcmp(command->valuestring, "reset_totalizer") == 0) {
         const cJSON *confirm = cJSON_IsObject(param)

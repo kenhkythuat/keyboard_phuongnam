@@ -1,8 +1,11 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
@@ -32,6 +35,9 @@ static const char *TAG = "KEY_OUTPUT";
 #define AUTO_KEY_HOLD_TIME_MS          50
 #define AUTO_KEY_DELAY_BETWEEN_MS      50
 #define AUTO_KEY_REPEAT_DELAY_MS       2000
+#define SHORTCUT_OUTPUT_INTERVAL_MS    500U
+#define SHORTCUT_INPUT_TIMEOUT_MS      2000U
+#define SHORTCUT_OUTPUT_QUEUE_LENGTH   4U
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -72,6 +78,14 @@ static const gpio_num_t key_pins[KEY_OUTPUT_PIN_COUNT] = {
     PIN_D3,
     PIN_D4
 };
+
+typedef struct {
+    char sequence[SHORTCUT_PHYSICAL_KEY_MAX_LENGTH + 1U];
+} shortcut_output_message_t;
+
+static SemaphoreHandle_t s_key_output_mutex;
+static QueueHandle_t s_shortcut_output_queue;
+static bool s_virtual_output_active;
 
 static void virtual_led_enable_init(void)
 {
@@ -139,6 +153,11 @@ static void key_gpio_init(void)
     };
 
     ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    s_key_output_mutex = xSemaphoreCreateMutex();
+    if (s_key_output_mutex == NULL) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
 }
 
 static void key_output_code(uint8_t key_code)
@@ -242,17 +261,28 @@ esp_err_t virtual_key_output_run_sequence(const char *sequence,
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (s_key_output_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_key_output_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    __atomic_store_n(&s_virtual_output_active, true, __ATOMIC_RELEASE);
+    esp_err_t result = ESP_OK;
+
     for (size_t index = 0; sequence[index] != '\0'; index++) {
         uint8_t key_code = key_code_from_char(sequence[index]);
         if (key_code == KEY_NONE) {
             ESP_LOGE(TAG, "Ky tu phim ao khong ho tro: %c", sequence[index]);
-            key_set_active(KEY_NONE);
-            return ESP_ERR_NOT_SUPPORTED;
+            result = ESP_ERR_NOT_SUPPORTED;
+            break;
         }
 
         esp_err_t err = key_press(key_code, AUTO_KEY_HOLD_TIME_MS);
         if (err != ESP_OK) {
-            return err;
+            result = err;
+            break;
         }
 
         if (sequence[index + 1U] != '\0') {
@@ -260,7 +290,15 @@ esp_err_t virtual_key_output_run_sequence(const char *sequence,
         }
     }
 
-    return ESP_OK;
+    key_set_active(KEY_NONE);
+    __atomic_store_n(&s_virtual_output_active, false, __ATOMIC_RELEASE);
+    xSemaphoreGive(s_key_output_mutex);
+    return result;
+}
+
+bool virtual_key_output_is_active(void)
+{
+    return __atomic_load_n(&s_virtual_output_active, __ATOMIC_ACQUIRE);
 }
 
 static void auto_key_sequence_task(void *argument)
@@ -450,6 +488,123 @@ static uint8_t keypad_get_first_key(uint32_t pressed_mask)
     return KEY_NONE;
 }
 
+static char keypad_key_to_character(uint8_t key_code)
+{
+    switch (key_code) {
+        case KEY_0:      return '0';
+        case KEY_1:      return '1';
+        case KEY_2:      return '2';
+        case KEY_3:      return '3';
+        case KEY_4:      return '4';
+        case KEY_5:      return '5';
+        case KEY_6:      return '6';
+        case KEY_7:      return '7';
+        case KEY_8:      return '8';
+        case KEY_9:      return '9';
+        case KEY_HASH:   return '#';
+        case KEY_DOLLAR: return '$';
+        case KEY_C:      return 'C';
+        case KEY_E:      return 'E';
+        case KEY_L:      return 'L';
+        case KEY_P:      return 'P';
+        case KEY_T:      return 'T';
+        case KEY_V:      return 'V';
+        default:         return '\0';
+    }
+}
+
+static bool keypad_find_shortcut(uint8_t key_code,
+                                 shortcut_mapping_t *mapping)
+{
+    static char input[SHORTCUT_KEY_MAX_LENGTH + 1U];
+    static size_t input_length;
+    static TickType_t last_key_tick;
+
+    char character = keypad_key_to_character(key_code);
+    if (character == '\0') {
+        input_length = 0U;
+        input[0] = '\0';
+        return false;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (input_length > 0U &&
+        (now - last_key_tick) > pdMS_TO_TICKS(SHORTCUT_INPUT_TIMEOUT_MS)) {
+        input_length = 0U;
+    }
+    last_key_tick = now;
+
+    if (input_length == SHORTCUT_KEY_MAX_LENGTH) {
+        memmove(input, input + 1U, SHORTCUT_KEY_MAX_LENGTH - 1U);
+        input_length--;
+    }
+    input[input_length++] = character;
+    input[input_length] = '\0';
+
+    if (!device_settings_find_shortcut_suffix(input, mapping)) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Nhan shortcut vat ly %s -> %s",
+             mapping->shortcut_key, mapping->physical_key);
+    input_length = 0U;
+    input[0] = '\0';
+    return true;
+}
+
+static bool shortcut_output_queue(const shortcut_mapping_t *mapping)
+{
+    if (s_shortcut_output_queue == NULL || mapping == NULL) {
+        return false;
+    }
+
+    shortcut_output_message_t message = {0};
+    strlcpy(message.sequence, mapping->physical_key,
+            sizeof(message.sequence));
+    if (xQueueSend(s_shortcut_output_queue, &message, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Shortcut output queue day, bo qua %s",
+                 mapping->shortcut_key);
+        return false;
+    }
+    return true;
+}
+
+static void shortcut_output_task(void *argument)
+{
+    (void)argument;
+    shortcut_output_message_t message;
+
+    while (1) {
+        if (xQueueReceive(s_shortcut_output_queue, &message,
+                          portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "Bat dau phat shortcut: %s", message.sequence);
+            esp_err_t err = virtual_key_output_run_sequence(
+                message.sequence, SHORTCUT_OUTPUT_INTERVAL_MS);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Phat shortcut that bai: %s",
+                         esp_err_to_name(err));
+            }
+        }
+    }
+}
+
+static esp_err_t shortcut_output_start(void)
+{
+    s_shortcut_output_queue = xQueueCreate(
+        SHORTCUT_OUTPUT_QUEUE_LENGTH, sizeof(shortcut_output_message_t));
+    if (s_shortcut_output_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreate(shortcut_output_task, "shortcut_output", 3072,
+                    NULL, 4, NULL) != pdPASS) {
+        vQueueDelete(s_shortcut_output_queue);
+        s_shortcut_output_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static void keypad_log_changed_keys(uint32_t old_mask, uint32_t new_mask)
 {
     uint32_t changed_mask = old_mask ^ new_mask;
@@ -483,6 +638,8 @@ static void keypad_scan_task(void *argument)
 
     uint32_t stable_mask = 0;
     uint32_t last_sample_mask = 0;
+    bool shortcut_pending = false;
+    shortcut_mapping_t pending_mapping = {0};
 
     while (1) {
         uint32_t sample_mask = keypad_scan_matrix();
@@ -500,7 +657,17 @@ static void keypad_scan_task(void *argument)
                 ESP_LOGW(TAG, "Phim # vat ly dang bi khoa, bo qua lan nhan");
                 physical_key = KEY_NONE;
             }
-            key_set_active(physical_key);
+
+            if (!virtual_key_output_is_active()) {
+                key_set_active(physical_key);
+                if (physical_key != KEY_NONE) {
+                    shortcut_pending = keypad_find_shortcut(
+                        physical_key, &pending_mapping);
+                } else if (shortcut_pending) {
+                    (void)shortcut_output_queue(&pending_mapping);
+                    shortcut_pending = false;
+                }
+            }
 #endif
         }
 
@@ -545,6 +712,12 @@ void app_main(void)
     key_gpio_init();
     key_release();
     ESP_LOGI(TAG, "Combine keypad functions enabled");
+
+    esp_err_t shortcut_result = shortcut_output_start();
+    if (shortcut_result != ESP_OK) {
+        ESP_LOGE(TAG, "Shortcut output init failed: %s",
+                 esp_err_to_name(shortcut_result));
+    }
 #endif
 
     esp_err_t command_result = mqtt_command_handler_start();
