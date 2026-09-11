@@ -19,6 +19,7 @@
 
 #include "pump_data_sniffer.h"
 #include "pump_transaction_filter.h"
+#include "control_display_led.h"
 
 /* =========================================================
  * GPIO đọc tín hiệu từ mạch bên ngoài
@@ -54,10 +55,6 @@
 
 #define DISPLAY_ROWS               3U
 #define DISPLAY_COLUMNS            6U
-
-void control_display_led_init(void);
-void control_display_led_set_segments(
-    const uint8_t segments[DISPLAY_ROWS][DISPLAY_COLUMNS]);
 
 #define RX_SLOT_COUNT              16U
 

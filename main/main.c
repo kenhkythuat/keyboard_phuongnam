@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <inttypes.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -13,6 +15,7 @@
 #include "esp_log.h"
 
 #include "device_settings.h"
+#include "control_display_led.h"
 #include "pump_data_sniffer.h"
 #include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
@@ -38,6 +41,9 @@ static const char *TAG = "KEY_OUTPUT";
 #define SHORTCUT_OUTPUT_INTERVAL_MS    500U
 #define SHORTCUT_INPUT_TIMEOUT_MS      2000U
 #define SHORTCUT_OUTPUT_QUEUE_LENGTH   4U
+#define TOTALIZER_VIEW_POLL_MS         50U
+#define TOTALIZER_VIEW_TASK_STACK_SIZE 4096U
+#define TOTALIZER_VIEW_MAX_SEGMENTS    CONTROL_DISPLAY_COLUMNS
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -86,6 +92,9 @@ typedef struct {
 static SemaphoreHandle_t s_key_output_mutex;
 static QueueHandle_t s_shortcut_output_queue;
 static bool s_virtual_output_active;
+static TaskHandle_t s_totalizer_view_task_handle;
+static bool s_totalizer_view_active;
+static bool s_totalizer_view_exit_requested;
 
 static void virtual_led_enable_init(void)
 {
@@ -514,11 +523,14 @@ static char keypad_key_to_character(uint8_t key_code)
 }
 
 static bool keypad_find_shortcut(uint8_t key_code,
-                                 shortcut_mapping_t *mapping)
+                                 shortcut_mapping_t *mapping,
+                                 bool *totalizer_view_requested)
 {
     static char input[SHORTCUT_KEY_MAX_LENGTH + 1U];
     static size_t input_length;
     static TickType_t last_key_tick;
+
+    *totalizer_view_requested = false;
 
     char character = keypad_key_to_character(key_code);
     if (character == '\0') {
@@ -540,6 +552,21 @@ static bool keypad_find_shortcut(uint8_t key_code,
     }
     input[input_length++] = character;
     input[input_length] = '\0';
+
+    if (input_length >= 3U &&
+        strcmp(input + input_length - 3U, "P88") == 0) {
+        input_length = 0U;
+        input[0] = '\0';
+        *totalizer_view_requested = true;
+        ESP_LOGI(TAG, "Da decode du chuoi vat ly P88");
+        return false;
+    }
+
+    if (input[input_length - 1U] == 'P' ||
+        (input_length >= 2U &&
+         strcmp(input + input_length - 2U, "P8") == 0)) {
+        return false;
+    }
 
     if (!device_settings_find_shortcut_suffix(input, mapping)) {
         return false;
@@ -605,6 +632,227 @@ static esp_err_t shortcut_output_start(void)
     return ESP_OK;
 }
 
+static uint8_t display_digit_segments(char digit)
+{
+    static const uint8_t segments[] = {
+        0x3FU, 0x06U, 0x5BU, 0x4FU, 0x66U,
+        0x6DU, 0x7DU, 0x07U, 0x7FU, 0x6FU
+    };
+    return segments[(size_t)(digit - '0')];
+}
+
+static bool numeric_text_to_segments(const char *text,
+                                     uint8_t *segments,
+                                     size_t *segment_count)
+{
+    size_t count = 0U;
+    for (size_t index = 0U; text[index] != '\0'; index++) {
+        if (text[index] >= '0' && text[index] <= '9') {
+            if (count >= TOTALIZER_VIEW_MAX_SEGMENTS) {
+                return false;
+            }
+            segments[count++] = display_digit_segments(text[index]);
+        } else if (text[index] == '.' && count > 0U &&
+                   (segments[count - 1U] & 0x80U) == 0U) {
+            segments[count - 1U] |= 0x80U;
+        } else {
+            return false;
+        }
+    }
+    if (count == 0U) {
+        return false;
+    }
+    *segment_count = count;
+    return true;
+}
+
+static bool format_amount_vnd(uint64_t amount_vnd, char *output,
+                              size_t output_size)
+{
+    char digits[32];
+    int digit_count = snprintf(digits, sizeof(digits), "%" PRIu64, amount_vnd);
+    if (digit_count <= 0 || (size_t)digit_count >= sizeof(digits)) {
+        return false;
+    }
+
+    size_t separator_count = ((size_t)digit_count - 1U) / 3U;
+    if ((size_t)digit_count + separator_count + 1U > output_size) {
+        return false;
+    }
+
+    size_t output_index = 0U;
+    for (size_t index = 0U; index < (size_t)digit_count; index++) {
+        output[output_index++] = digits[index];
+        size_t remaining_digits = (size_t)digit_count - index - 1U;
+        if (remaining_digits > 0U && (remaining_digits % 3U) == 0U) {
+            output[output_index++] = '.';
+        }
+    }
+    output[output_index] = '\0';
+    return true;
+}
+
+static bool render_totalizer_display(
+    const uint8_t *amount_segments,
+    size_t amount_count,
+    const uint8_t *volume_segments,
+    size_t volume_count,
+    uint8_t output[CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS])
+{
+    if (amount_count > CONTROL_DISPLAY_COLUMNS ||
+        volume_count > CONTROL_DISPLAY_COLUMNS) {
+        return false;
+    }
+
+    memset(output, 0, CONTROL_DISPLAY_ROWS * CONTROL_DISPLAY_COLUMNS);
+    memcpy(&output[0][CONTROL_DISPLAY_COLUMNS - amount_count],
+           amount_segments, amount_count);
+    memcpy(&output[2][CONTROL_DISPLAY_COLUMNS - volume_count],
+           volume_segments, volume_count);
+    return true;
+}
+
+static bool totalizer_view_trigger(void)
+{
+    bool expected = false;
+    if (s_totalizer_view_task_handle == NULL ||
+        !__atomic_compare_exchange_n(&s_totalizer_view_active, &expected, true,
+                                     false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+
+    __atomic_store_n(&s_totalizer_view_exit_requested, false,
+                     __ATOMIC_RELEASE);
+    xTaskNotifyGive(s_totalizer_view_task_handle);
+    return true;
+}
+
+static void totalizer_view_request_exit(void)
+{
+    __atomic_store_n(&s_totalizer_view_exit_requested, true,
+                     __ATOMIC_RELEASE);
+}
+
+static void totalizer_view_task(void *argument)
+{
+    (void)argument;
+
+    while (1) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        uint64_t total_amount_vnd = 0U;
+        double total_volume_l = 0.0;
+        esp_err_t err = read_totalizer(&total_amount_vnd, &total_volume_l);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "P88 doc Totalizer that bai: %s",
+                     esp_err_to_name(err));
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+        if (__atomic_load_n(&s_totalizer_view_exit_requested,
+                            __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+
+        char amount_text[32];
+        char volume_text[32];
+        int volume_length = snprintf(volume_text, sizeof(volume_text),
+                                     "%.3f", total_volume_l);
+        if (!format_amount_vnd(total_amount_vnd, amount_text,
+                               sizeof(amount_text)) ||
+            volume_length <= 0 || (size_t)volume_length >= sizeof(volume_text) ||
+            !isfinite(total_volume_l)) {
+            ESP_LOGE(TAG, "P88 khong format duoc du lieu Totalizer");
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+
+        char *decimal = strchr(volume_text, '.');
+        char *end = volume_text + strlen(volume_text) - 1U;
+        while (decimal != NULL && end > decimal + 1U && *end == '0') {
+            *end-- = '\0';
+        }
+
+        uint8_t amount_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
+        uint8_t volume_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
+        size_t amount_count = 0U;
+        size_t volume_count = 0U;
+        if (!numeric_text_to_segments(amount_text, amount_segments,
+                                      &amount_count) ||
+            !numeric_text_to_segments(volume_text, volume_segments,
+                                      &volume_count)) {
+            ESP_LOGE(TAG, "P88 du lieu Totalizer vuot kha nang hien thi");
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+
+        uint8_t display[CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS];
+        if (!render_totalizer_display(amount_segments, amount_count,
+                                      volume_segments, volume_count,
+                                      display)) {
+            ESP_LOGE(TAG, "P88 moi gia tri chi duoc toi da %u LED",
+                     (unsigned)CONTROL_DISPLAY_COLUMNS);
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+        err = control_display_led_begin_virtual(display);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Khong bat duoc Virtual LED: %s",
+                     esp_err_to_name(err));
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+
+        err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Khong bat duoc IO39: %s", esp_err_to_name(err));
+            control_display_led_end_virtual();
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+        ESP_LOGI(TAG, "P88 hien thi Totalizer: amount=%" PRIu64
+                      " volume=%.3f, IO39=1",
+                 total_amount_vnd, total_volume_l);
+
+        while (!__atomic_load_n(&s_totalizer_view_exit_requested,
+                                __ATOMIC_ACQUIRE)) {
+            vTaskDelay(pdMS_TO_TICKS(TOTALIZER_VIEW_POLL_MS));
+        }
+
+        err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Khong tra duoc IO39 ve 0: %s",
+                     esp_err_to_name(err));
+        }
+        control_display_led_end_virtual();
+        __atomic_store_n(&s_totalizer_view_exit_requested, false,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&s_totalizer_view_active, false,
+                         __ATOMIC_RELEASE);
+        ESP_LOGI(TAG, "Thoat P88, IO39=0, tra man hinh ve mach ngoai");
+    }
+}
+
+static esp_err_t totalizer_view_start(void)
+{
+    if (xTaskCreate(totalizer_view_task, "totalizer_view",
+                    TOTALIZER_VIEW_TASK_STACK_SIZE, NULL, 4,
+                    &s_totalizer_view_task_handle) != pdPASS) {
+        s_totalizer_view_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static void keypad_log_changed_keys(uint32_t old_mask, uint32_t new_mask)
 {
     uint32_t changed_mask = old_mask ^ new_mask;
@@ -639,6 +887,7 @@ static void keypad_scan_task(void *argument)
     uint32_t stable_mask = 0;
     uint32_t last_sample_mask = 0;
     bool shortcut_pending = false;
+    bool totalizer_view_pending = false;
     shortcut_mapping_t pending_mapping = {0};
 
     while (1) {
@@ -658,11 +907,30 @@ static void keypad_scan_task(void *argument)
                 physical_key = KEY_NONE;
             }
 
-            if (!virtual_key_output_is_active()) {
+            if (__atomic_load_n(&s_totalizer_view_active,
+                                __ATOMIC_ACQUIRE)) {
+                if (!virtual_key_output_is_active()) {
+                    key_set_active(KEY_NONE);
+                }
+                shortcut_pending = false;
+                totalizer_view_pending = false;
+                if (physical_key != KEY_NONE) {
+                    ESP_LOGI(TAG, "Nhan phim %s, yeu cau thoat P88",
+                             key_get_name(physical_key));
+                    totalizer_view_request_exit();
+                }
+            } else if (!virtual_key_output_is_active()) {
                 key_set_active(physical_key);
                 if (physical_key != KEY_NONE) {
                     shortcut_pending = keypad_find_shortcut(
-                        physical_key, &pending_mapping);
+                        physical_key, &pending_mapping,
+                        &totalizer_view_pending);
+                } else if (totalizer_view_pending) {
+                    if (!totalizer_view_trigger()) {
+                        ESP_LOGW(TAG, "Khong the bat che do xem P88");
+                    }
+                    totalizer_view_pending = false;
+                    shortcut_pending = false;
                 } else if (shortcut_pending) {
                     (void)shortcut_output_queue(&pending_mapping);
                     shortcut_pending = false;
@@ -724,6 +992,12 @@ void app_main(void)
     if (command_result != ESP_OK) {
         ESP_LOGE(TAG, "MQTT command handler init failed: %s",
                  esp_err_to_name(command_result));
+    }
+
+    esp_err_t totalizer_view_result = totalizer_view_start();
+    if (totalizer_view_result != ESP_OK) {
+        ESP_LOGE(TAG, "Totalizer view init failed: %s",
+                 esp_err_to_name(totalizer_view_result));
     }
 
 #if ENABLE_AUTO_KEY_SEQUENCE

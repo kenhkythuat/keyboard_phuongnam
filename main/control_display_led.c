@@ -11,6 +11,8 @@
 #include "esp_log.h"
 #include "esp_err.h"
 
+#include "control_display_led.h"
+
 /* =========================================================
  * Káº¾T Ná»I ESP32-S3 -> MBI5026
  * ========================================================= */
@@ -24,8 +26,8 @@
  */
 #define PIN_LE      GPIO_NUM_35
 
-#define DISPLAY_ROWS       3
-#define DISPLAY_COLUMNS    6
+#define DISPLAY_ROWS       CONTROL_DISPLAY_ROWS
+#define DISPLAY_COLUMNS    CONTROL_DISPLAY_COLUMNS
 
 /*
  * 1: QuÃ©t tá»«ng LED riÃªng biá»‡t, tá»•ng cá»™ng 18 slot.
@@ -85,6 +87,8 @@ static const char *TAG = "MBI5026_7SEG";
  * Má»—i pháº§n tá»­ chá»©a mÃ£ segment A...G, DP.
  */
 static uint8_t display_buffer[DISPLAY_ROWS][DISPLAY_COLUMNS];
+static uint8_t external_display_buffer[DISPLAY_ROWS][DISPLAY_COLUMNS];
+static bool virtual_display_active;
 
 static portMUX_TYPE display_lock = portMUX_INITIALIZER_UNLOCKED;
 static esp_timer_handle_t scan_timer_handle;
@@ -278,13 +282,7 @@ static void scan_timer_callback(void *arg)
 static void display_clear(void)
 {
     portENTER_CRITICAL(&display_lock);
-
-    for (int row = 0; row < DISPLAY_ROWS; row++) {
-        for (int column = 0; column < DISPLAY_COLUMNS; column++) {
-            display_buffer[row][column] = 0;
-        }
-    }
-
+    memset(display_buffer, 0, sizeof(display_buffer));
     portEXIT_CRITICAL(&display_lock);
 }
 
@@ -301,7 +299,50 @@ void control_display_led_set_segments(
     }
 
     portENTER_CRITICAL(&display_lock);
+    memcpy(external_display_buffer, segments, sizeof(external_display_buffer));
+    if (!virtual_display_active) {
+        memcpy(display_buffer, segments, sizeof(display_buffer));
+    }
+    portEXIT_CRITICAL(&display_lock);
+}
+
+esp_err_t control_display_led_begin_virtual(
+    const uint8_t segments[DISPLAY_ROWS][DISPLAY_COLUMNS])
+{
+    if (segments == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&display_lock);
+    virtual_display_active = true;
     memcpy(display_buffer, segments, sizeof(display_buffer));
+    portEXIT_CRITICAL(&display_lock);
+    return ESP_OK;
+}
+
+esp_err_t control_display_led_set_virtual_segments(
+    const uint8_t segments[DISPLAY_ROWS][DISPLAY_COLUMNS])
+{
+    if (segments == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t result = ESP_OK;
+    portENTER_CRITICAL(&display_lock);
+    if (!virtual_display_active) {
+        result = ESP_ERR_INVALID_STATE;
+    } else {
+        memcpy(display_buffer, segments, sizeof(display_buffer));
+    }
+    portEXIT_CRITICAL(&display_lock);
+    return result;
+}
+
+void control_display_led_end_virtual(void)
+{
+    portENTER_CRITICAL(&display_lock);
+    memcpy(display_buffer, external_display_buffer, sizeof(display_buffer));
+    virtual_display_active = false;
     portEXIT_CRITICAL(&display_lock);
 }
 
@@ -363,6 +404,8 @@ void control_display_led_init(void)
 #endif
 
     display_gpio_init();
+    memset(external_display_buffer, 0, sizeof(external_display_buffer));
+    virtual_display_active = false;
     display_clear();
 
     const esp_timer_create_args_t scan_timer_args = {

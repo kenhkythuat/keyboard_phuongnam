@@ -10,6 +10,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "cJSON.h"
@@ -46,10 +47,15 @@ typedef struct {
 
 static const char *TAG = "MQTT_COMMAND";
 static QueueHandle_t s_command_queue;
+static SemaphoreHandle_t s_totalizer_mutex;
 static bool s_started;
+static bool s_price_edit_locked;
 static char s_request_history[DEDUP_HISTORY_LENGTH][REQUEST_ID_MAX_LENGTH + 1U];
 static size_t s_request_history_count;
 static size_t s_request_history_next;
+
+static esp_err_t reset_total_amount(void);
+static esp_err_t reset_total_volume(void);
 
 static bool string_field_is_valid(const cJSON *item, size_t max_length)
 {
@@ -447,6 +453,51 @@ static esp_err_t read_total_volume(double *total_volume_l)
     return ESP_ERR_INVALID_RESPONSE;
 }
 
+esp_err_t read_totalizer(uint64_t *total_amount_vnd,
+                         double *total_volume_l)
+{
+    if (total_amount_vnd == NULL || total_volume_l == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *total_amount_vnd = 0U;
+    *total_volume_l = 0.0;
+
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_totalizer_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = read_total_amount(total_amount_vnd);
+    if (err == ESP_OK) {
+        err = read_total_volume(total_volume_l);
+    }
+    if (err != ESP_OK) {
+        *total_amount_vnd = 0U;
+        *total_volume_l = 0.0;
+    }
+    xSemaphoreGive(s_totalizer_mutex);
+    return err;
+}
+
+static esp_err_t reset_totalizer(void)
+{
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_totalizer_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = reset_total_amount();
+    if (err == ESP_OK) {
+        err = reset_total_volume();
+    }
+    xSemaphoreGive(s_totalizer_mutex);
+    return err;
+}
+
 static esp_err_t reset_total_amount(void)
 {
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
@@ -808,6 +859,63 @@ static esp_err_t publish_shortcut_mapping_ack(
     return err;
 }
 
+static esp_err_t publish_price_edit_lock_ack(const char *request_id,
+                                             bool price_edit_locked)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    if (root == NULL || reported == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool reported_built = cJSON_AddBoolToObject(
+        reported, "price_edit_locked", price_edit_locked) != NULL;
+    bool root_built = reported_built &&
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "ack_to",
+                               "set_price_edit_lock") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL &&
+        cJSON_AddStringToObject(root, "description",
+                               "price_edit_lock_updated") != NULL;
+    bool reported_attached = root_built &&
+                             cJSON_AddItemToObject(root, "reported", reported);
+    bool built = reported_attached &&
+                 cJSON_AddStringToObject(root, "time_device",
+                                         snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = mqtt_manager_publish_ack(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ACK price edit lock queued: result=ok "
+                      "description=price_edit_lock_updated "
+                      "price_edit_locked=%s",
+                 price_edit_locked ? "true" : "false");
+    }
+    cJSON_free(payload);
+    return err;
+}
+
 static void process_command(const command_message_t *message)
 {
     cJSON *root = cJSON_ParseWithLength(message->payload, message->length);
@@ -959,10 +1067,7 @@ static void process_command(const command_message_t *message)
             return;
         }
 
-        esp_err_t err = reset_total_amount();
-        if (err == ESP_OK) {
-            err = reset_total_volume();
-        }
+        esp_err_t err = reset_totalizer();
 
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "RESET_TOTALIZER THAT BAI: %s", esp_err_to_name(err));
@@ -991,6 +1096,55 @@ static void process_command(const command_message_t *message)
             ESP_LOGI(TAG, "Reset totalizer hoan tat va da ACK");
         } else {
             ESP_LOGE(TAG, "Publish ACK reset_totalizer that bai: %s",
+                     esp_err_to_name(err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (envelope_valid &&
+        strcmp(command->valuestring, "set_price_edit_lock") == 0) {
+        const cJSON *locked_item =
+            cJSON_GetObjectItemCaseSensitive(param, "locked");
+        if (!cJSON_IsBool(locked_item) || cJSON_GetArraySize(param) != 1) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK set_price_edit_lock invalid_param "
+                              "that bai: %s",
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        bool requested_locked = cJSON_IsTrue(locked_item);
+        __atomic_store_n(&s_price_edit_locked, requested_locked,
+                         __ATOMIC_RELEASE);
+        bool actual_locked = __atomic_load_n(&s_price_edit_locked,
+                                             __ATOMIC_ACQUIRE);
+        if (actual_locked != requested_locked) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "verification_failed", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        esp_err_t err = publish_price_edit_lock_ack(
+            request_id->valuestring, actual_locked);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK set_price_edit_lock that bai: %s",
                      esp_err_to_name(err));
         }
         cJSON_Delete(root);
@@ -1047,6 +1201,60 @@ static void process_command(const command_message_t *message)
         return;
     }
 
+    if (envelope_valid && strcmp(command->valuestring, "close_shift") == 0) {
+        if (cJSON_GetArraySize(param) != 0) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK close_shift invalid_param that bai: %s",
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint64_t total_amount_vnd = 0U;
+        double total_volume_l = 0.0;
+        esp_err_t err = read_totalizer(&total_amount_vnd, &total_volume_l);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "CLOSE_SHIFT doc Totalizer that bai: %s",
+                     esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "verification_failed", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK loi close_shift that bai: %s",
+                         esp_err_to_name(ack_err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_ack(
+            request_id->valuestring, command->valuestring,
+            "ok", "shift_closed",
+            false, 0U, false, false,
+            true, total_amount_vnd, total_volume_l);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+            ESP_LOGI(TAG, "Close shift ACK queued: amount=%" PRIu64
+                          " VND volume=%.3f L",
+                     total_amount_vnd, total_volume_l);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK close_shift that bai: %s",
+                     esp_err_to_name(err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
     if (envelope_valid && strcmp(command->valuestring, "get_totalizer") == 0) {
         if (cJSON_GetArraySize(param) != 0) {
             esp_err_t err = publish_ack(
@@ -1062,10 +1270,7 @@ static void process_command(const command_message_t *message)
 
         uint64_t total_amount_vnd = 0U;
         double total_volume_l = 0.0;
-        esp_err_t err = read_total_amount(&total_amount_vnd);
-        if (err == ESP_OK) {
-            err = read_total_volume(&total_volume_l);
-        }
+        esp_err_t err = read_totalizer(&total_amount_vnd, &total_volume_l);
 
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "GET_TOTALIZER THAT BAI: %s", esp_err_to_name(err));
@@ -1218,8 +1423,15 @@ esp_err_t mqtt_command_handler_start(void)
         return ESP_OK;
     }
 
+    s_totalizer_mutex = xSemaphoreCreateMutex();
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     s_command_queue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(command_message_t));
     if (s_command_queue == NULL) {
+        vSemaphoreDelete(s_totalizer_mutex);
+        s_totalizer_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1227,6 +1439,8 @@ esp_err_t mqtt_command_handler_start(void)
                     NULL, COMMAND_TASK_PRIORITY, NULL) != pdPASS) {
         vQueueDelete(s_command_queue);
         s_command_queue = NULL;
+        vSemaphoreDelete(s_totalizer_mutex);
+        s_totalizer_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 
