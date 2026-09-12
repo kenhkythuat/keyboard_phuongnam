@@ -39,6 +39,8 @@
 #define TOTALIZER_VERIFY_TIMEOUT_MS 3000U
 #define TOTALIZER_DISPLAY_SETTLE_MS 1000U
 #define TOTALIZER_TELEMETRY_JSON_SIZE 256U
+#define CALIBRATION_ENTRY_SEQUENCE "C#122973E"
+#define CALIBRATION_MAX_ATTEMPTS   3U
 
 typedef struct {
     size_t length;
@@ -341,6 +343,73 @@ static bool wait_for_e0(uint32_t baseline_generation)
     return false;
 }
 
+static bool display_has_p06(
+    const uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS])
+{
+    for (size_t column = 0U; column < 3U; column++) {
+        if ((display[0][column] & 0x7FU) != 0x00U) {
+            return false;
+        }
+    }
+    return (display[0][3] & 0x7FU) == 0x73U &&
+           (display[0][4] & 0x7FU) == 0x3FU &&
+           (display[0][5] & 0x7FU) == 0x7DU;
+}
+
+static bool display_row_matches_raw_command(
+    const uint8_t row[PUMP_DATA_DISPLAY_COLUMNS],
+    const char *raw_command)
+{
+    size_t length = strlen(raw_command);
+    if (length == 0U || length > PUMP_DATA_DISPLAY_COLUMNS) {
+        return false;
+    }
+
+    size_t first_digit = PUMP_DATA_DISPLAY_COLUMNS - length;
+    for (size_t column = 0U; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
+        if ((row[column] & 0x80U) != 0U) {
+            return false;
+        }
+        if (column < first_digit) {
+            if ((row[column] & 0x7FU) != 0x00U) {
+                return false;
+            }
+            continue;
+        }
+
+        uint8_t digit;
+        bool blank;
+        if (!segment_to_digit(row[column], &digit, &blank) || blank ||
+            digit != (uint8_t)(raw_command[column - first_digit] - '0')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool wait_for_calibration_display(uint32_t baseline_generation,
+                                         const char *raw_command,
+                                         bool require_p06,
+                                         bool require_e0)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            (!require_p06 || display_has_p06(display)) &&
+            (!require_e0 || display_has_e0(display)) &&
+            (raw_command == NULL ||
+             display_row_matches_raw_command(display[1], raw_command))) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
 static bool wait_for_reset_total_volume_screen(uint32_t baseline_generation)
 {
     TickType_t start = xTaskGetTickCount();
@@ -388,6 +457,73 @@ static uint32_t get_display_generation(void)
     uint32_t generation = 0U;
     (void)mbi_sniffer_get_display_snapshot(display, &generation);
     return generation;
+}
+
+static esp_err_t execute_calibration_locked(const char *raw_command)
+{
+    for (uint32_t attempt = 1U; attempt <= CALIBRATION_MAX_ATTEMPTS;
+         attempt++) {
+        ESP_LOGI(TAG, "Calibration %s lan %u/%u", raw_command,
+                 (unsigned)attempt, (unsigned)CALIBRATION_MAX_ATTEMPTS);
+
+        uint32_t baseline_generation = get_display_generation();
+        esp_err_t err = virtual_key_output_run_sequence(
+            CALIBRATION_ENTRY_SEQUENCE, VIRTUAL_KEY_INTERVAL_MS);
+        if (err == ESP_OK &&
+            wait_for_calibration_display(baseline_generation, NULL,
+                                         true, false)) {
+            ESP_LOGI(TAG, "Calibration da xac nhan man hinh P06");
+
+            baseline_generation = get_display_generation();
+            err = virtual_key_output_run_sequence(raw_command,
+                                                  VIRTUAL_KEY_INTERVAL_MS);
+            if (err == ESP_OK &&
+                wait_for_calibration_display(baseline_generation,
+                                             raw_command, false, false)) {
+                ESP_LOGI(TAG, "Calibration da xac nhan command echo=%s",
+                         raw_command);
+
+                baseline_generation = get_display_generation();
+                err = virtual_key_output_run_sequence(
+                    "E", VIRTUAL_KEY_INTERVAL_MS);
+                if (err == ESP_OK &&
+                    wait_for_calibration_display(baseline_generation,
+                                                 raw_command, false, true)) {
+                    ESP_LOGI(TAG, "Calibration thanh cong: E0, echo=%s",
+                             raw_command);
+                    vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+                    err = virtual_key_output_run_sequence(
+                        "C", VIRTUAL_KEY_INTERVAL_MS);
+                    if (err == ESP_OK) {
+                        return ESP_OK;
+                    }
+                }
+            }
+        }
+
+        ESP_LOGW(TAG, "Calibration %s khong xac nhan duoc o lan %u",
+                 raw_command, (unsigned)attempt);
+        (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
+esp_err_t execute_calibration_command(const char *raw_command)
+{
+    if (!device_settings_calibration_mapping_is_valid("P", raw_command)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_totalizer_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = execute_calibration_locked(raw_command);
+    xSemaphoreGive(s_totalizer_mutex);
+    return err;
 }
 
 static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
@@ -916,6 +1052,63 @@ static esp_err_t publish_price_edit_lock_ack(const char *request_id,
     return err;
 }
 
+static esp_err_t publish_calibration_ack(const char *request_id,
+                                         const calibration_mapping_t *mapping)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    if (root == NULL || reported == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool reported_built =
+        cJSON_AddStringToObject(reported, "name", mapping->name) != NULL &&
+        cJSON_AddStringToObject(reported, "command_echo",
+                                mapping->raw_command) != NULL;
+    bool root_built = reported_built &&
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "ack_to",
+                               "send_calibration_command") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL &&
+        cJSON_AddStringToObject(root, "description",
+                               "calibration_command_applied") != NULL;
+    bool reported_attached = root_built &&
+                             cJSON_AddItemToObject(root, "reported", reported);
+    bool built = reported_attached &&
+                 cJSON_AddStringToObject(root, "time_device",
+                                         snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = mqtt_manager_publish_ack(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ACK calibration queued: name=%s command_echo=%s",
+                 mapping->name, mapping->raw_command);
+    }
+    cJSON_free(payload);
+    return err;
+}
+
 static void process_command(const command_message_t *message)
 {
     cJSON *root = cJSON_ParseWithLength(message->payload, message->length);
@@ -1362,6 +1555,89 @@ static void process_command(const command_message_t *message)
                      esp_err_to_name(err));
         } else {
             ESP_LOGI(TAG, "Da hoan thanh chuoi phim set_unit_price");
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (envelope_valid &&
+        strcmp(command->valuestring, "send_calibration_command") == 0) {
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(param, "name");
+        const cJSON *raw_command =
+            cJSON_GetObjectItemCaseSensitive(param, "raw_command");
+        bool param_valid = cJSON_GetArraySize(param) == 2 &&
+            string_field_is_valid(name, SHORTCUT_KEY_MAX_LENGTH) &&
+            string_field_is_valid(raw_command,
+                                  CALIBRATION_RAW_COMMAND_MAX_LENGTH) &&
+            device_settings_calibration_mapping_is_valid(
+                name->valuestring, raw_command->valuestring);
+        if (!param_valid) {
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK calibration invalid_param that bai: %s",
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        esp_err_t err = execute_calibration_command(raw_command->valuestring);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Calibration MQTT that bai sau %u lan: %s",
+                     (unsigned)CALIBRATION_MAX_ATTEMPTS,
+                     esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "verification_failed", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = device_settings_set_calibration_mapping(
+            name->valuestring, raw_command->valuestring);
+        calibration_mapping_t readback = {0};
+        if (err == ESP_OK) {
+            err = device_settings_get_calibration_mapping(
+                name->valuestring, &readback);
+            if (err == ESP_OK &&
+                (strcmp(readback.name, name->valuestring) != 0 ||
+                 strcmp(readback.raw_command,
+                        raw_command->valuestring) != 0)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+        if (err != ESP_OK) {
+            const char *description =
+                (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_NOT_FOUND)
+                    ? "verification_failed" : "storage_error";
+            ESP_LOGE(TAG, "Luu calibration mapping that bai: %s",
+                     esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", description, false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_calibration_ack(request_id->valuestring, &readback);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK calibration that bai: %s",
+                     esp_err_to_name(err));
         }
         cJSON_Delete(root);
         return;

@@ -85,7 +85,13 @@ static const gpio_num_t key_pins[KEY_OUTPUT_PIN_COUNT] = {
     PIN_D4
 };
 
+typedef enum {
+    SHORTCUT_OUTPUT_SEQUENCE,
+    SHORTCUT_OUTPUT_CALIBRATION,
+} shortcut_output_type_t;
+
 typedef struct {
+    shortcut_output_type_t type;
     char sequence[SHORTCUT_PHYSICAL_KEY_MAX_LENGTH + 1U];
 } shortcut_output_message_t;
 
@@ -524,12 +530,15 @@ static char keypad_key_to_character(uint8_t key_code)
 
 static bool keypad_find_shortcut(uint8_t key_code,
                                  shortcut_mapping_t *mapping,
+                                 calibration_mapping_t *calibration_mapping,
+                                 bool *calibration_requested,
                                  bool *totalizer_view_requested)
 {
     static char input[SHORTCUT_KEY_MAX_LENGTH + 1U];
     static size_t input_length;
     static TickType_t last_key_tick;
 
+    *calibration_requested = false;
     *totalizer_view_requested = false;
 
     char character = keypad_key_to_character(key_code);
@@ -568,6 +577,17 @@ static bool keypad_find_shortcut(uint8_t key_code,
         return false;
     }
 
+    if (device_settings_find_calibration_suffix(input,
+                                                calibration_mapping)) {
+        ESP_LOGI(TAG, "Nhan calibration shortcut vat ly %s -> %s",
+                 calibration_mapping->name,
+                 calibration_mapping->raw_command);
+        input_length = 0U;
+        input[0] = '\0';
+        *calibration_requested = true;
+        return false;
+    }
+
     if (!device_settings_find_shortcut_suffix(input, mapping)) {
         return false;
     }
@@ -586,11 +606,32 @@ static bool shortcut_output_queue(const shortcut_mapping_t *mapping)
     }
 
     shortcut_output_message_t message = {0};
+    message.type = SHORTCUT_OUTPUT_SEQUENCE;
     strlcpy(message.sequence, mapping->physical_key,
             sizeof(message.sequence));
     if (xQueueSend(s_shortcut_output_queue, &message, 0) != pdTRUE) {
         ESP_LOGE(TAG, "Shortcut output queue day, bo qua %s",
                  mapping->shortcut_key);
+        return false;
+    }
+    return true;
+}
+
+static bool calibration_output_queue(
+    const calibration_mapping_t *mapping)
+{
+    if (s_shortcut_output_queue == NULL || mapping == NULL) {
+        return false;
+    }
+
+    shortcut_output_message_t message = {
+        .type = SHORTCUT_OUTPUT_CALIBRATION,
+    };
+    strlcpy(message.sequence, mapping->raw_command,
+            sizeof(message.sequence));
+    if (xQueueSend(s_shortcut_output_queue, &message, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Shortcut output queue day, bo qua calibration %s",
+                 mapping->name);
         return false;
     }
     return true;
@@ -604,12 +645,22 @@ static void shortcut_output_task(void *argument)
     while (1) {
         if (xQueueReceive(s_shortcut_output_queue, &message,
                           portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "Bat dau phat shortcut: %s", message.sequence);
-            esp_err_t err = virtual_key_output_run_sequence(
-                message.sequence, SHORTCUT_OUTPUT_INTERVAL_MS);
+            esp_err_t err;
+            if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
+                ESP_LOGI(TAG, "Bat dau calibration local: %s",
+                         message.sequence);
+                err = execute_calibration_command(message.sequence);
+            } else {
+                ESP_LOGI(TAG, "Bat dau phat shortcut: %s", message.sequence);
+                err = virtual_key_output_run_sequence(
+                    message.sequence, SHORTCUT_OUTPUT_INTERVAL_MS);
+            }
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Phat shortcut that bai: %s",
+                ESP_LOGE(TAG, "Xu ly shortcut that bai: %s",
                          esp_err_to_name(err));
+            } else if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
+                ESP_LOGI(TAG, "Calibration local hoan tat: %s",
+                         message.sequence);
             }
         }
     }
@@ -623,7 +674,7 @@ static esp_err_t shortcut_output_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    if (xTaskCreate(shortcut_output_task, "shortcut_output", 3072,
+    if (xTaskCreate(shortcut_output_task, "shortcut_output", 4096,
                     NULL, 4, NULL) != pdPASS) {
         vQueueDelete(s_shortcut_output_queue);
         s_shortcut_output_queue = NULL;
@@ -887,8 +938,10 @@ static void keypad_scan_task(void *argument)
     uint32_t stable_mask = 0;
     uint32_t last_sample_mask = 0;
     bool shortcut_pending = false;
+    bool calibration_pending = false;
     bool totalizer_view_pending = false;
     shortcut_mapping_t pending_mapping = {0};
+    calibration_mapping_t pending_calibration = {0};
 
     while (1) {
         uint32_t sample_mask = keypad_scan_matrix();
@@ -913,6 +966,7 @@ static void keypad_scan_task(void *argument)
                     key_set_active(KEY_NONE);
                 }
                 shortcut_pending = false;
+                calibration_pending = false;
                 totalizer_view_pending = false;
                 if (physical_key != KEY_NONE) {
                     ESP_LOGI(TAG, "Nhan phim %s, yeu cau thoat P88",
@@ -924,12 +978,18 @@ static void keypad_scan_task(void *argument)
                 if (physical_key != KEY_NONE) {
                     shortcut_pending = keypad_find_shortcut(
                         physical_key, &pending_mapping,
+                        &pending_calibration, &calibration_pending,
                         &totalizer_view_pending);
                 } else if (totalizer_view_pending) {
                     if (!totalizer_view_trigger()) {
                         ESP_LOGW(TAG, "Khong the bat che do xem P88");
                     }
                     totalizer_view_pending = false;
+                    calibration_pending = false;
+                    shortcut_pending = false;
+                } else if (calibration_pending) {
+                    (void)calibration_output_queue(&pending_calibration);
+                    calibration_pending = false;
                     shortcut_pending = false;
                 } else if (shortcut_pending) {
                     (void)shortcut_output_queue(&pending_mapping);
