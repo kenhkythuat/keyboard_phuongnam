@@ -41,6 +41,7 @@
 #define TOTALIZER_TELEMETRY_JSON_SIZE 256U
 #define CALIBRATION_ENTRY_SEQUENCE "C#122973E"
 #define CALIBRATION_MAX_ATTEMPTS   3U
+#define CALIBRATION_RAW_COMMAND_DELAY_MS 1000U
 
 typedef struct {
     size_t length;
@@ -64,6 +65,48 @@ static bool string_field_is_valid(const cJSON *item, size_t max_length)
     return cJSON_IsString(item) && item->valuestring != NULL &&
            item->valuestring[0] != '\0' &&
            strlen(item->valuestring) <= max_length;
+}
+
+static bool get_indexed_param_pair(const cJSON *param,
+                                   const char *first_base,
+                                   const char *second_base,
+                                   uint8_t max_slot,
+                                   const cJSON **first,
+                                   const cJSON **second,
+                                   uint8_t *slot)
+{
+    if (!cJSON_IsObject(param) || cJSON_GetArraySize(param) != 2 ||
+        first == NULL || second == NULL || slot == NULL) {
+        return false;
+    }
+
+    char first_name[32];
+    char second_name[32];
+    for (uint8_t candidate = 1U; candidate <= max_slot; candidate++) {
+        int first_length = snprintf(first_name, sizeof(first_name), "%s_%u",
+                                    first_base, (unsigned)candidate);
+        int second_length = snprintf(second_name, sizeof(second_name), "%s_%u",
+                                     second_base, (unsigned)candidate);
+        if (first_length <= 0 || first_length >= (int)sizeof(first_name) ||
+            second_length <= 0 || second_length >= (int)sizeof(second_name)) {
+            return false;
+        }
+
+        const cJSON *first_item =
+            cJSON_GetObjectItemCaseSensitive(param, first_name);
+        const cJSON *second_item =
+            cJSON_GetObjectItemCaseSensitive(param, second_name);
+        if (first_item != NULL || second_item != NULL) {
+            if (first_item == NULL || second_item == NULL) {
+                return false;
+            }
+            *first = first_item;
+            *second = second_item;
+            *slot = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool request_was_processed(const char *request_id)
@@ -472,8 +515,11 @@ static esp_err_t execute_calibration_locked(const char *raw_command)
         if (err == ESP_OK &&
             wait_for_calibration_display(baseline_generation, NULL,
                                          true, false)) {
-            ESP_LOGI(TAG, "Calibration da xac nhan man hinh P06");
+            ESP_LOGI(TAG, "Calibration da xac nhan man hinh P06, cho %u ms "
+                          "truoc khi nhap raw_command",
+                     (unsigned)CALIBRATION_RAW_COMMAND_DELAY_MS);
 
+            vTaskDelay(pdMS_TO_TICKS(CALIBRATION_RAW_COMMAND_DELAY_MS));
             baseline_generation = get_display_generation();
             err = virtual_key_output_run_sequence(raw_command,
                                                   VIRTUAL_KEY_INTERVAL_MS);
@@ -925,6 +971,7 @@ static esp_err_t publish_ack(const char *request_id,
 static esp_err_t publish_shortcut_mapping_ack(
     const char *request_id,
     const shortcut_mapping_t *mapping,
+    uint8_t slot,
     uint32_t revision)
 {
     time_manager_snapshot_t snapshot;
@@ -988,8 +1035,9 @@ static esp_err_t publish_shortcut_mapping_ack(
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "ACK shortcut queued: result=ok "
                       "description=shortcut_mapping_updated "
-                      "%s -> %s revision=%" PRIu32,
-                 mapping->shortcut_key, mapping->physical_key, revision);
+                      "slot=%u %s -> %s revision=%" PRIu32,
+                 (unsigned)slot, mapping->shortcut_key,
+                 mapping->physical_key, revision);
     }
     cJSON_free(payload);
     return err;
@@ -1053,7 +1101,8 @@ static esp_err_t publish_price_edit_lock_ack(const char *request_id,
 }
 
 static esp_err_t publish_calibration_ack(const char *request_id,
-                                         const calibration_mapping_t *mapping)
+                                         const calibration_mapping_t *mapping,
+                                         uint8_t slot)
 {
     time_manager_snapshot_t snapshot;
     esp_err_t err = time_manager_get_snapshot(&snapshot);
@@ -1102,8 +1151,8 @@ static esp_err_t publish_calibration_ack(const char *request_id,
     }
     err = mqtt_manager_publish_ack(payload);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "ACK calibration queued: name=%s command_echo=%s",
-                 mapping->name, mapping->raw_command);
+        ESP_LOGI(TAG, "ACK calibration queued: slot=%u name=%s command_echo=%s",
+                 (unsigned)slot, mapping->name, mapping->raw_command);
     }
     cJSON_free(payload);
     return err;
@@ -1156,12 +1205,12 @@ static void process_command(const command_message_t *message)
         cJSON_IsObject(param);
 
     if (strcmp(command->valuestring, "set_shortcut_mapping") == 0) {
-        const cJSON *physical_key = cJSON_IsObject(param)
-            ? cJSON_GetObjectItemCaseSensitive(param, "physical_key") : NULL;
-        const cJSON *shortcut_key = cJSON_IsObject(param)
-            ? cJSON_GetObjectItemCaseSensitive(param, "shortcut_key") : NULL;
-        bool param_valid = envelope_valid &&
-            cJSON_GetArraySize(param) == 2 &&
+        const cJSON *physical_key = NULL;
+        const cJSON *shortcut_key = NULL;
+        uint8_t slot = 0U;
+        bool param_valid = envelope_valid && get_indexed_param_pair(
+            param, "physical_key", "shortcut_key",
+            SHORTCUT_MAPPING_MAX_COUNT, &physical_key, &shortcut_key, &slot) &&
             string_field_is_valid(physical_key,
                                   SHORTCUT_PHYSICAL_KEY_MAX_LENGTH) &&
             string_field_is_valid(shortcut_key, SHORTCUT_KEY_MAX_LENGTH) &&
@@ -1180,13 +1229,14 @@ static void process_command(const command_message_t *message)
         }
 
         uint32_t revision = 0U;
-        esp_err_t err = device_settings_set_shortcut_mapping(
-            shortcut_key->valuestring, physical_key->valuestring, &revision);
+        esp_err_t err = device_settings_set_shortcut_mapping_at(
+            slot, shortcut_key->valuestring, physical_key->valuestring,
+            &revision);
         shortcut_mapping_t readback = {0};
         uint32_t readback_revision = 0U;
         if (err == ESP_OK) {
-            err = device_settings_get_shortcut_mapping(
-                shortcut_key->valuestring, &readback, &readback_revision);
+            err = device_settings_get_shortcut_mapping_at(
+                slot, &readback, &readback_revision);
             if (err == ESP_OK &&
                 (strcmp(readback.shortcut_key,
                         shortcut_key->valuestring) != 0 ||
@@ -1225,7 +1275,8 @@ static void process_command(const command_message_t *message)
         }
 
         err = publish_shortcut_mapping_ack(request_id->valuestring,
-                                           &readback, readback_revision);
+                                           &readback, slot,
+                                           readback_revision);
         if (err == ESP_OK) {
             remember_request(request_id->valuestring);
         } else {
@@ -1562,10 +1613,12 @@ static void process_command(const command_message_t *message)
 
     if (envelope_valid &&
         strcmp(command->valuestring, "send_calibration_command") == 0) {
-        const cJSON *name = cJSON_GetObjectItemCaseSensitive(param, "name");
-        const cJSON *raw_command =
-            cJSON_GetObjectItemCaseSensitive(param, "raw_command");
-        bool param_valid = cJSON_GetArraySize(param) == 2 &&
+        const cJSON *name = NULL;
+        const cJSON *raw_command = NULL;
+        uint8_t slot = 0U;
+        bool param_valid = get_indexed_param_pair(
+            param, "name", "raw_command", CALIBRATION_MAPPING_MAX_COUNT,
+            &name, &raw_command, &slot) &&
             string_field_is_valid(name, SHORTCUT_KEY_MAX_LENGTH) &&
             string_field_is_valid(raw_command,
                                   CALIBRATION_RAW_COMMAND_MAX_LENGTH) &&
@@ -1602,12 +1655,11 @@ static void process_command(const command_message_t *message)
             return;
         }
 
-        err = device_settings_set_calibration_mapping(
-            name->valuestring, raw_command->valuestring);
+        err = device_settings_set_calibration_mapping_at(
+            slot, name->valuestring, raw_command->valuestring);
         calibration_mapping_t readback = {0};
         if (err == ESP_OK) {
-            err = device_settings_get_calibration_mapping(
-                name->valuestring, &readback);
+            err = device_settings_get_calibration_mapping_at(slot, &readback);
             if (err == ESP_OK &&
                 (strcmp(readback.name, name->valuestring) != 0 ||
                  strcmp(readback.raw_command,
@@ -1616,9 +1668,14 @@ static void process_command(const command_message_t *message)
             }
         }
         if (err != ESP_OK) {
-            const char *description =
-                (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_NOT_FOUND)
-                    ? "verification_failed" : "storage_error";
+            const char *description;
+            if (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_NOT_FOUND) {
+                description = "verification_failed";
+            } else if (err == ESP_ERR_INVALID_ARG) {
+                description = "invalid_param";
+            } else {
+                description = "storage_error";
+            }
             ESP_LOGE(TAG, "Luu calibration mapping that bai: %s",
                      esp_err_to_name(err));
             esp_err_t ack_err = publish_ack(
@@ -1632,7 +1689,8 @@ static void process_command(const command_message_t *message)
             return;
         }
 
-        err = publish_calibration_ack(request_id->valuestring, &readback);
+        err = publish_calibration_ack(request_id->valuestring, &readback,
+                                      slot);
         if (err == ESP_OK) {
             remember_request(request_id->valuestring);
         } else {

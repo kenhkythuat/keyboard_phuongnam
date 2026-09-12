@@ -92,7 +92,7 @@ static int64_t s_column1_missing_since_us = 0;
 
 #define CAPTURE_YIELD_INTERVAL     16U
 #define REPORT_PERIOD_MS           500U
-#define ENABLE_PERIODIC_REPORT_LOG 0
+#define ENABLE_PERIODIC_REPORT_LOG 1
 
 #define INVALID_ASSEMBLY_OFFSET    0xFFU
 #define USE_FIXED_BIT_OFFSET       1

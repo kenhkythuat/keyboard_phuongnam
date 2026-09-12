@@ -14,9 +14,12 @@
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
 #define SHORTCUT_STORE_MAGIC     0x53434D50UL
-#define SHORTCUT_STORE_VERSION   1U
+#define SHORTCUT_STORE_VERSION   2U
+#define SHORTCUT_STORE_LEGACY_VERSION 1U
 #define CALIBRATION_STORE_MAGIC  0x43414C42UL
-#define CALIBRATION_STORE_VERSION 1U
+#define CALIBRATION_STORE_VERSION 2U
+#define CALIBRATION_STORE_LEGACY_VERSION 1U
+#define CALIBRATION_STORAGE_SLOT_COUNT 10U
 
 typedef struct {
     uint32_t magic;
@@ -30,7 +33,8 @@ typedef struct {
     uint32_t magic;
     uint16_t version;
     uint16_t count;
-    calibration_mapping_t mappings[CALIBRATION_MAPPING_MAX_COUNT];
+    /* Keep the legacy blob size so existing NVS data can be migrated. */
+    calibration_mapping_t mappings[CALIBRATION_STORAGE_SLOT_COUNT];
 } calibration_store_t;
 
 static const char *TAG = "DEVICE_SETTINGS";
@@ -83,15 +87,9 @@ static bool shortcut_string_is_valid(const char *value, size_t max_length)
     return true;
 }
 
-static int find_shortcut_index(const shortcut_store_t *store,
-                               const char *shortcut_key)
+static bool shortcut_entry_is_empty(const shortcut_mapping_t *entry)
 {
-    for (uint16_t index = 0U; index < store->count; index++) {
-        if (strcmp(store->mappings[index].shortcut_key, shortcut_key) == 0) {
-            return (int)index;
-        }
-    }
-    return -1;
+    return entry->shortcut_key[0] == '\0' && entry->physical_key[0] == '\0';
 }
 
 static bool raw_command_is_valid(const char *raw_command)
@@ -112,62 +110,104 @@ static bool raw_command_is_valid(const char *raw_command)
     return true;
 }
 
-static int find_calibration_index(const calibration_store_t *store,
-                                  const char *name)
+static bool calibration_entry_is_empty(const calibration_mapping_t *entry)
 {
-    for (uint16_t index = 0U; index < store->count; index++) {
-        if (strcmp(store->mappings[index].name, name) == 0) {
-            return (int)index;
-        }
-    }
-    return -1;
+    return entry->name[0] == '\0' && entry->raw_command[0] == '\0';
 }
 
-static bool shortcut_store_is_valid(const shortcut_store_t *store)
+static bool shortcut_store_is_valid(const shortcut_store_t *store,
+                                    uint16_t expected_version)
 {
     if (store->magic != SHORTCUT_STORE_MAGIC ||
-        store->version != SHORTCUT_STORE_VERSION ||
+        store->version != expected_version ||
         store->count > SHORTCUT_MAPPING_MAX_COUNT) {
         return false;
     }
-    for (uint16_t index = 0U; index < store->count; index++) {
+
+    uint16_t occupied = 0U;
+    uint16_t limit = expected_version == SHORTCUT_STORE_LEGACY_VERSION
+                         ? store->count : SHORTCUT_MAPPING_MAX_COUNT;
+    for (uint16_t index = 0U; index < limit; index++) {
+        if (shortcut_entry_is_empty(&store->mappings[index])) {
+            if (expected_version == SHORTCUT_STORE_LEGACY_VERSION) {
+                return false;
+            }
+            continue;
+        }
+        if (store->mappings[index].shortcut_key[0] == '\0' ||
+            store->mappings[index].physical_key[0] == '\0') {
+            return false;
+        }
         if (!shortcut_string_is_valid(store->mappings[index].shortcut_key,
                                       SHORTCUT_KEY_MAX_LENGTH) ||
             !shortcut_string_is_valid(store->mappings[index].physical_key,
                                       SHORTCUT_PHYSICAL_KEY_MAX_LENGTH)) {
             return false;
         }
-        for (uint16_t other = index + 1U; other < store->count; other++) {
+        occupied++;
+        for (uint16_t other = index + 1U; other < limit; other++) {
+            if (shortcut_entry_is_empty(&store->mappings[other])) {
+                continue;
+            }
             if (strcmp(store->mappings[index].shortcut_key,
                        store->mappings[other].shortcut_key) == 0) {
                 return false;
             }
         }
     }
-    return true;
+    return occupied == store->count;
 }
 
-static bool calibration_store_is_valid(const calibration_store_t *store)
+static bool calibration_store_is_valid(const calibration_store_t *store,
+                                       uint16_t expected_version)
 {
     if (store->magic != CALIBRATION_STORE_MAGIC ||
-        store->version != CALIBRATION_STORE_VERSION ||
-        store->count > CALIBRATION_MAPPING_MAX_COUNT) {
+        store->version != expected_version ||
+        store->count > (expected_version == CALIBRATION_STORE_LEGACY_VERSION
+                            ? CALIBRATION_STORAGE_SLOT_COUNT
+                            : CALIBRATION_MAPPING_MAX_COUNT)) {
         return false;
     }
-    for (uint16_t index = 0U; index < store->count; index++) {
+
+    uint16_t occupied = 0U;
+    uint16_t limit = expected_version == CALIBRATION_STORE_LEGACY_VERSION
+                         ? store->count : CALIBRATION_MAPPING_MAX_COUNT;
+    for (uint16_t index = 0U; index < limit; index++) {
+        if (calibration_entry_is_empty(&store->mappings[index])) {
+            if (expected_version == CALIBRATION_STORE_LEGACY_VERSION) {
+                return false;
+            }
+            continue;
+        }
+        if (store->mappings[index].name[0] == '\0' ||
+            store->mappings[index].raw_command[0] == '\0') {
+            return false;
+        }
         if (!shortcut_string_is_valid(store->mappings[index].name,
                                       SHORTCUT_KEY_MAX_LENGTH) ||
             !raw_command_is_valid(store->mappings[index].raw_command)) {
             return false;
         }
-        for (uint16_t other = index + 1U; other < store->count; other++) {
+        occupied++;
+        for (uint16_t other = index + 1U; other < limit; other++) {
+            if (calibration_entry_is_empty(&store->mappings[other])) {
+                continue;
+            }
             if (strcmp(store->mappings[index].name,
                        store->mappings[other].name) == 0) {
                 return false;
             }
         }
     }
-    return true;
+    if (expected_version == CALIBRATION_STORE_VERSION) {
+        for (uint16_t index = CALIBRATION_MAPPING_MAX_COUNT;
+             index < CALIBRATION_STORAGE_SLOT_COUNT; index++) {
+            if (!calibration_entry_is_empty(&store->mappings[index])) {
+                return false;
+            }
+        }
+    }
+    return occupied == store->count;
 }
 
 esp_err_t device_settings_init(void)
@@ -192,6 +232,7 @@ esp_err_t device_settings_init(void)
     }
 
     shortcut_store_t stored_shortcuts;
+    bool shortcuts_migrated = false;
     size_t blob_size = sizeof(stored_shortcuts);
     err = nvs_get_blob(s_nvs_handle, SHORTCUT_MAPPING_KEY,
                        &stored_shortcuts, &blob_size);
@@ -201,14 +242,28 @@ esp_err_t device_settings_init(void)
     } else if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
+    } else if (blob_size == sizeof(stored_shortcuts) &&
+               shortcut_store_is_valid(&stored_shortcuts,
+                                       SHORTCUT_STORE_LEGACY_VERSION)) {
+        for (uint16_t index = stored_shortcuts.count;
+             index < SHORTCUT_MAPPING_MAX_COUNT; index++) {
+            memset(&stored_shortcuts.mappings[index], 0,
+                   sizeof(stored_shortcuts.mappings[index]));
+        }
+        stored_shortcuts.version = SHORTCUT_STORE_VERSION;
+        shortcuts_migrated = true;
+        ESP_LOGI(TAG, "Chuyen shortcut NVS cu sang slot 1..%u",
+                 (unsigned)stored_shortcuts.count);
     } else if (blob_size != sizeof(stored_shortcuts) ||
-               !shortcut_store_is_valid(&stored_shortcuts)) {
+               !shortcut_store_is_valid(&stored_shortcuts,
+                                        SHORTCUT_STORE_VERSION)) {
         ESP_LOGW(TAG, "Shortcut mapping NVS khong hop le, dung bang rong");
         reset_shortcut_store(&stored_shortcuts);
         err = ESP_OK;
     }
 
     calibration_store_t stored_calibrations;
+    bool calibrations_migrated = false;
     blob_size = sizeof(stored_calibrations);
     err = nvs_get_blob(s_nvs_handle, CALIBRATION_MAPPING_KEY,
                        &stored_calibrations, &blob_size);
@@ -218,11 +273,48 @@ esp_err_t device_settings_init(void)
     } else if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
+    } else if (blob_size == sizeof(stored_calibrations) &&
+               calibration_store_is_valid(
+                   &stored_calibrations,
+                   CALIBRATION_STORE_LEGACY_VERSION)) {
+        uint16_t retained = stored_calibrations.count;
+        if (retained > CALIBRATION_MAPPING_MAX_COUNT) {
+            retained = CALIBRATION_MAPPING_MAX_COUNT;
+            ESP_LOGW(TAG, "Calibration NVS cu co qua 5 mapping, chi giu 5 slot dau");
+        }
+        for (uint16_t index = retained;
+             index < CALIBRATION_STORAGE_SLOT_COUNT; index++) {
+            memset(&stored_calibrations.mappings[index], 0,
+                   sizeof(stored_calibrations.mappings[index]));
+        }
+        stored_calibrations.count = retained;
+        stored_calibrations.version = CALIBRATION_STORE_VERSION;
+        calibrations_migrated = true;
+        ESP_LOGI(TAG, "Chuyen calibration NVS cu sang slot 1..%u",
+                 (unsigned)retained);
     } else if (blob_size != sizeof(stored_calibrations) ||
-               !calibration_store_is_valid(&stored_calibrations)) {
+               !calibration_store_is_valid(&stored_calibrations,
+                                           CALIBRATION_STORE_VERSION)) {
         ESP_LOGW(TAG, "Calibration mapping NVS khong hop le, dung bang rong");
         reset_calibration_store(&stored_calibrations);
         err = ESP_OK;
+    }
+
+    if (shortcuts_migrated) {
+        err = nvs_set_blob(s_nvs_handle, SHORTCUT_MAPPING_KEY,
+                           &stored_shortcuts, sizeof(stored_shortcuts));
+    }
+    if (err == ESP_OK && calibrations_migrated) {
+        err = nvs_set_blob(s_nvs_handle, CALIBRATION_MAPPING_KEY,
+                           &stored_calibrations,
+                           sizeof(stored_calibrations));
+    }
+    if (err == ESP_OK && (shortcuts_migrated || calibrations_migrated)) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
     }
 
     portENTER_CRITICAL(&s_shortcut_lock);
@@ -282,7 +374,8 @@ bool device_settings_shortcut_mapping_is_valid(const char *shortcut_key,
                                     SHORTCUT_PHYSICAL_KEY_MAX_LENGTH);
 }
 
-esp_err_t device_settings_set_shortcut_mapping(
+esp_err_t device_settings_set_shortcut_mapping_at(
+    uint8_t slot,
     const char *shortcut_key,
     const char *physical_key,
     uint32_t *revision)
@@ -290,7 +383,8 @@ esp_err_t device_settings_set_shortcut_mapping(
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!device_settings_shortcut_mapping_is_valid(shortcut_key,
+    if (slot == 0U || slot > SHORTCUT_MAPPING_MAX_COUNT ||
+        !device_settings_shortcut_mapping_is_valid(shortcut_key,
                                                    physical_key)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -300,19 +394,24 @@ esp_err_t device_settings_set_shortcut_mapping(
     updated = s_shortcut_store;
     portEXIT_CRITICAL(&s_shortcut_lock);
 
-    int index = find_shortcut_index(&updated, shortcut_key);
-    if (index >= 0 &&
+    uint16_t index = (uint16_t)(slot - 1U);
+    for (uint16_t other = 0U; other < SHORTCUT_MAPPING_MAX_COUNT; other++) {
+        if (other != index &&
+            !shortcut_entry_is_empty(&updated.mappings[other]) &&
+            strcmp(updated.mappings[other].shortcut_key, shortcut_key) == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (!shortcut_entry_is_empty(&updated.mappings[index]) &&
+        strcmp(updated.mappings[index].shortcut_key, shortcut_key) == 0 &&
         strcmp(updated.mappings[index].physical_key, physical_key) == 0) {
         if (revision != NULL) {
             *revision = updated.revision;
         }
         return ESP_OK;
     }
-    if (index < 0) {
-        if (updated.count >= SHORTCUT_MAPPING_MAX_COUNT) {
-            return ESP_ERR_NO_MEM;
-        }
-        index = (int)updated.count;
+    if (shortcut_entry_is_empty(&updated.mappings[index])) {
         updated.count++;
     }
 
@@ -350,20 +449,20 @@ esp_err_t device_settings_set_shortcut_mapping(
     if (revision != NULL) {
         *revision = readback.revision;
     }
-    ESP_LOGI(TAG, "Da luu shortcut %s -> %s, revision=%" PRIu32,
-             shortcut_key, physical_key, readback.revision);
+    ESP_LOGI(TAG, "Da luu shortcut slot %u: %s -> %s, revision=%" PRIu32,
+             (unsigned)slot, shortcut_key, physical_key, readback.revision);
     return ESP_OK;
 }
 
-esp_err_t device_settings_get_shortcut_mapping(
-    const char *shortcut_key,
+esp_err_t device_settings_get_shortcut_mapping_at(
+    uint8_t slot,
     shortcut_mapping_t *mapping,
     uint32_t *revision)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (shortcut_key == NULL || mapping == NULL) {
+    if (slot == 0U || slot > SHORTCUT_MAPPING_MAX_COUNT || mapping == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -372,8 +471,8 @@ esp_err_t device_settings_get_shortcut_mapping(
     current = s_shortcut_store;
     portEXIT_CRITICAL(&s_shortcut_lock);
 
-    int index = find_shortcut_index(&current, shortcut_key);
-    if (index < 0) {
+    uint16_t index = (uint16_t)(slot - 1U);
+    if (shortcut_entry_is_empty(&current.mappings[index])) {
         return ESP_ERR_NOT_FOUND;
     }
     *mapping = current.mappings[index];
@@ -398,7 +497,10 @@ bool device_settings_find_shortcut_suffix(const char *input,
     size_t input_length = strlen(input);
     int best_index = -1;
     size_t best_length = 0U;
-    for (uint16_t index = 0U; index < current.count; index++) {
+    for (uint16_t index = 0U; index < SHORTCUT_MAPPING_MAX_COUNT; index++) {
+        if (shortcut_entry_is_empty(&current.mappings[index])) {
+            continue;
+        }
         size_t shortcut_length = strlen(current.mappings[index].shortcut_key);
         if (shortcut_length <= input_length && shortcut_length > best_length &&
             strcmp(input + input_length - shortcut_length,
@@ -421,13 +523,15 @@ bool device_settings_calibration_mapping_is_valid(const char *name,
            raw_command_is_valid(raw_command);
 }
 
-esp_err_t device_settings_set_calibration_mapping(const char *name,
-                                                  const char *raw_command)
+esp_err_t device_settings_set_calibration_mapping_at(uint8_t slot,
+                                                     const char *name,
+                                                     const char *raw_command)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!device_settings_calibration_mapping_is_valid(name, raw_command)) {
+    if (slot == 0U || slot > CALIBRATION_MAPPING_MAX_COUNT ||
+        !device_settings_calibration_mapping_is_valid(name, raw_command)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -436,16 +540,22 @@ esp_err_t device_settings_set_calibration_mapping(const char *name,
     updated = s_calibration_store;
     portEXIT_CRITICAL(&s_calibration_lock);
 
-    int index = find_calibration_index(&updated, name);
-    if (index >= 0 &&
+    uint16_t index = (uint16_t)(slot - 1U);
+    for (uint16_t other = 0U; other < CALIBRATION_MAPPING_MAX_COUNT; other++) {
+        if (other != index &&
+            !calibration_entry_is_empty(&updated.mappings[other]) &&
+            strcmp(updated.mappings[other].name, name) == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    if (!calibration_entry_is_empty(&updated.mappings[index]) &&
+        strcmp(updated.mappings[index].name, name) == 0 &&
         strcmp(updated.mappings[index].raw_command, raw_command) == 0) {
         return ESP_OK;
     }
-    if (index < 0) {
-        if (updated.count >= CALIBRATION_MAPPING_MAX_COUNT) {
-            return ESP_ERR_NO_MEM;
-        }
-        index = (int)updated.count++;
+    if (calibration_entry_is_empty(&updated.mappings[index])) {
+        updated.count++;
     }
 
     calibration_mapping_t *entry = &updated.mappings[index];
@@ -474,19 +584,20 @@ esp_err_t device_settings_set_calibration_mapping(const char *name,
     portENTER_CRITICAL(&s_calibration_lock);
     s_calibration_store = readback;
     portEXIT_CRITICAL(&s_calibration_lock);
-    ESP_LOGI(TAG, "Da luu calibration shortcut %s -> %s",
-             name, raw_command);
+    ESP_LOGI(TAG, "Da luu calibration slot %u: %s -> %s",
+             (unsigned)slot, name, raw_command);
     return ESP_OK;
 }
 
-esp_err_t device_settings_get_calibration_mapping(
-    const char *name,
+esp_err_t device_settings_get_calibration_mapping_at(
+    uint8_t slot,
     calibration_mapping_t *mapping)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (name == NULL || mapping == NULL) {
+    if (slot == 0U || slot > CALIBRATION_MAPPING_MAX_COUNT ||
+        mapping == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -495,8 +606,8 @@ esp_err_t device_settings_get_calibration_mapping(
     current = s_calibration_store;
     portEXIT_CRITICAL(&s_calibration_lock);
 
-    int index = find_calibration_index(&current, name);
-    if (index < 0) {
+    uint16_t index = (uint16_t)(slot - 1U);
+    if (calibration_entry_is_empty(&current.mappings[index])) {
         return ESP_ERR_NOT_FOUND;
     }
     *mapping = current.mappings[index];
@@ -519,7 +630,10 @@ bool device_settings_find_calibration_suffix(
     size_t input_length = strlen(input);
     int best_index = -1;
     size_t best_length = 0U;
-    for (uint16_t index = 0U; index < current.count; index++) {
+    for (uint16_t index = 0U; index < CALIBRATION_MAPPING_MAX_COUNT; index++) {
+        if (calibration_entry_is_empty(&current.mappings[index])) {
+            continue;
+        }
         size_t name_length = strlen(current.mappings[index].name);
         if (name_length <= input_length && name_length > best_length &&
             strcmp(input + input_length - name_length,
