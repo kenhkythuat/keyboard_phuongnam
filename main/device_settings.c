@@ -9,8 +9,11 @@
 #include "freertos/FreeRTOS.h"
 #include "nvs.h"
 
+#include "device_config.h"
+
 #define SETTINGS_NAMESPACE       "device_cfg"
 #define HASH_KEY_LOCKED_KEY      "hash_lock"
+#define MODE_CALIBRATION_KEY     "cal_mode"
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
 #define SHORTCUT_STORE_MAGIC     0x53434D50UL
@@ -40,11 +43,13 @@ typedef struct {
 static const char *TAG = "DEVICE_SETTINGS";
 static nvs_handle_t s_nvs_handle;
 static bool s_hash_key_locked;
+static char s_mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 static bool s_initialized;
 static shortcut_store_t s_shortcut_store;
 static calibration_store_t s_calibration_store;
 static portMUX_TYPE s_shortcut_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_mode_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void reset_shortcut_store(shortcut_store_t *store)
 {
@@ -231,6 +236,34 @@ esp_err_t device_settings_init(void)
         return err;
     }
 
+    char stored_mode[sizeof(s_mode_calibration)] = DEFAULT_MODE_CALIBRATION;
+    size_t stored_mode_size = 0U;
+    err = nvs_get_str(s_nvs_handle, MODE_CALIBRATION_KEY, NULL,
+                      &stored_mode_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    } else if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    } else if (stored_mode_size > sizeof(stored_mode)) {
+        ESP_LOGW(TAG, "mode_calibration trong NVS qua dai, dung mac dinh %s",
+                 DEFAULT_MODE_CALIBRATION);
+    } else {
+        err = nvs_get_str(s_nvs_handle, MODE_CALIBRATION_KEY, stored_mode,
+                          &stored_mode_size);
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+        if (!shortcut_string_is_valid(stored_mode,
+                                      SHORTCUT_KEY_MAX_LENGTH)) {
+            ESP_LOGW(TAG, "mode_calibration trong NVS khong hop le, dung mac dinh %s",
+                     DEFAULT_MODE_CALIBRATION);
+            strlcpy(stored_mode, DEFAULT_MODE_CALIBRATION,
+                    sizeof(stored_mode));
+        }
+    }
+
     shortcut_store_t stored_shortcuts;
     bool shortcuts_migrated = false;
     size_t blob_size = sizeof(stored_shortcuts);
@@ -326,6 +359,9 @@ esp_err_t device_settings_init(void)
     portEXIT_CRITICAL(&s_calibration_lock);
 
     __atomic_store_n(&s_hash_key_locked, stored_value != 0U, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&s_mode_calibration_lock);
+    strlcpy(s_mode_calibration, stored_mode, sizeof(s_mode_calibration));
+    portEXIT_CRITICAL(&s_mode_calibration_lock);
     s_initialized = true;
     ESP_LOGI(TAG, "Khoi phuc hash_key_locked=%s tu Flash",
              stored_value != 0U ? "true" : "false");
@@ -333,6 +369,8 @@ esp_err_t device_settings_init(void)
              (unsigned)stored_shortcuts.count, stored_shortcuts.revision);
     ESP_LOGI(TAG, "Khoi phuc %u calibration mapping tu Flash",
              (unsigned)stored_calibrations.count);
+    ESP_LOGI(TAG, "Khoi phuc mode_calibration=%s tu Flash/mac dinh",
+             stored_mode);
     return ESP_OK;
 }
 
@@ -362,6 +400,67 @@ esp_err_t device_settings_set_hash_key_locked(bool locked)
     __atomic_store_n(&s_hash_key_locked, locked, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "Da luu hash_key_locked=%s vao Flash",
              locked ? "true" : "false");
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_mode_calibration(char *mode, size_t size)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (mode == NULL || size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_mode_calibration_lock);
+    size_t required_size = strlen(s_mode_calibration) + 1U;
+    if (required_size <= size) {
+        memcpy(mode, s_mode_calibration, required_size);
+    }
+    portEXIT_CRITICAL(&s_mode_calibration_lock);
+
+    return required_size <= size ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t device_settings_set_mode_calibration(const char *mode)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!shortcut_string_is_valid(mode, SHORTCUT_KEY_MAX_LENGTH)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char previous[sizeof(s_mode_calibration)];
+    portENTER_CRITICAL(&s_mode_calibration_lock);
+    strlcpy(previous, s_mode_calibration, sizeof(previous));
+    portEXIT_CRITICAL(&s_mode_calibration_lock);
+    if (strcmp(previous, mode) == 0) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = nvs_set_str(s_nvs_handle, MODE_CALIBRATION_KEY, mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char readback[sizeof(s_mode_calibration)];
+    size_t readback_size = sizeof(readback);
+    err = nvs_get_str(s_nvs_handle, MODE_CALIBRATION_KEY,
+                      readback, &readback_size);
+    if (err != ESP_OK || strcmp(readback, mode) != 0) {
+        (void)nvs_set_str(s_nvs_handle, MODE_CALIBRATION_KEY, previous);
+        (void)nvs_commit(s_nvs_handle);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    portENTER_CRITICAL(&s_mode_calibration_lock);
+    strlcpy(s_mode_calibration, readback, sizeof(s_mode_calibration));
+    portEXIT_CRITICAL(&s_mode_calibration_lock);
+    ESP_LOGI(TAG, "Da luu mode_calibration=%s vao Flash", readback);
     return ESP_OK;
 }
 

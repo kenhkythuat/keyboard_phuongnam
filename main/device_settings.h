@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -24,6 +25,8 @@ typedef struct {
 esp_err_t device_settings_init(void);
 bool device_settings_is_hash_key_locked(void);
 esp_err_t device_settings_set_hash_key_locked(bool locked);
+esp_err_t device_settings_get_mode_calibration(char *mode, size_t size);
+esp_err_t device_settings_set_mode_calibration(const char *mode);
 bool device_settings_shortcut_mapping_is_valid(const char *shortcut_key,
                                                const char *physical_key);
 esp_err_t device_settings_set_shortcut_mapping_at(

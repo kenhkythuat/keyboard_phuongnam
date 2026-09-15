@@ -13,6 +13,7 @@
 #include "cJSON.h"
 
 #include "device_config.h"
+#include "device_settings.h"
 #include "mqtt_manager.h"
 #include "pump_transaction_store.h"
 #include "time_manager.h"
@@ -42,6 +43,7 @@ static const char *TAG = "PUMP_FILTER";
 
 static QueueHandle_t s_display_queue;
 static bool s_started;
+static uint32_t s_current_unit_price;
 
 static bool segment_to_digit(uint8_t segments, uint8_t *digit, bool *blank)
 {
@@ -205,7 +207,8 @@ static esp_err_t publish_transaction_telemetry(
     if (cJSON_AddNumberToObject(data, "unit_price", transaction->unit_price) == NULL ||
         cJSON_AddNumberToObject(data, "amount_vnd", transaction->amount_vnd) == NULL ||
         cJSON_AddNumberToObject(data, "volume_ml", transaction->volume_ml) == NULL ||
-        cJSON_AddStringToObject(data, "command_code", TRANSACTION_COMMAND_CODE) == NULL ||
+        cJSON_AddStringToObject(data, "command_code",
+                               transaction->command_code) == NULL ||
         cJSON_AddStringToObject(data, "time_device", time_snapshot->time_device) == NULL ||
         cJSON_AddBoolToObject(data, "is_buffered", is_buffered) == NULL ||
         cJSON_AddNumberToObject(data, "RSSI", rssi) == NULL) {
@@ -265,7 +268,7 @@ static transaction_report_result_t report_completed_transaction(
         return TRANSACTION_REPORT_DONE;
     }
 
-    if (!command_code_is_valid(TRANSACTION_COMMAND_CODE)) {
+    if (!command_code_is_valid(transaction->command_code)) {
         ESP_LOGE(TAG, "command_code khong hop le");
         return TRANSACTION_REPORT_DONE;
     }
@@ -325,7 +328,7 @@ static transaction_report_result_t report_completed_transaction(
     ESP_LOGI(TAG, "volume_ml=%" PRIu32, transaction->volume_ml);
     ESP_LOGI(TAG, "ts=%" PRId64, time_snapshot.ts);
     ESP_LOGI(TAG, "time_device=%s", time_snapshot.time_device);
-    ESP_LOGI(TAG, "command_code=%s", TRANSACTION_COMMAND_CODE);
+    ESP_LOGI(TAG, "command_code=%s", transaction->command_code);
     ESP_LOGI(TAG, "is_buffered=%s", is_buffered ? "true" : "false");
     ESP_LOGI(TAG, "RSSI=%d dBm", (int)rssi);
     ESP_LOGI(
@@ -346,6 +349,7 @@ static void pump_transaction_filter_task(void *argument)
     pump_display_message_t message;
     pump_transaction_t latest_transaction = {0};
     pump_transaction_t previous_positive_transaction = {0};
+    char active_command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U] = {0};
     bool transaction_active = false;
     bool has_sale_data = false;
     bool has_positive_sample = false;
@@ -405,12 +409,31 @@ static void pump_transaction_filter_task(void *argument)
                 continue;
             }
 
+            if (transaction.unit_price > 0U) {
+                __atomic_store_n(&s_current_unit_price,
+                                 transaction.unit_price,
+                                 __ATOMIC_RELEASE);
+            }
+
             bool is_transaction_start =
                 transaction.amount_vnd == 0U &&
                 transaction.volume_ml == 0U &&
                 transaction.unit_price > 0U;
 
             if (is_transaction_start) {
+                esp_err_t mode_result = device_settings_get_mode_calibration(
+                    transaction.command_code,
+                    sizeof(transaction.command_code));
+                if (mode_result != ESP_OK) {
+                    strlcpy(transaction.command_code,
+                            DEFAULT_MODE_CALIBRATION,
+                            sizeof(transaction.command_code));
+                    ESP_LOGW(TAG, "Khong doc duoc mode_calibration, dung mac dinh %s: %s",
+                             DEFAULT_MODE_CALIBRATION,
+                             esp_err_to_name(mode_result));
+                }
+                strlcpy(active_command_code, transaction.command_code,
+                        sizeof(active_command_code));
                 transaction_active = true;
                 has_sale_data = false;
                 has_positive_sample = false;
@@ -430,6 +453,9 @@ static void pump_transaction_filter_task(void *argument)
             if (!transaction_active) {
                 continue;
             }
+
+            strlcpy(transaction.command_code, active_command_code,
+                    sizeof(transaction.command_code));
 
             bool positive_values =
                 transaction.amount_vnd > 0U &&
@@ -532,6 +558,7 @@ static void pump_transaction_filter_task(void *argument)
         memset(&latest_transaction, 0, sizeof(latest_transaction));
         memset(&previous_positive_transaction, 0,
                sizeof(previous_positive_transaction));
+        memset(active_command_code, 0, sizeof(active_command_code));
     }
 }
 
@@ -575,6 +602,25 @@ esp_err_t pump_transaction_filter_start(void)
         "Pump transaction filter enabled, stable_time=%u ms",
         (unsigned int)PUMP_DATA_STABLE_TIME_MS
     );
+    return ESP_OK;
+}
+
+esp_err_t pump_transaction_filter_get_unit_price(uint32_t *unit_price)
+{
+    if (unit_price == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t current = __atomic_load_n(&s_current_unit_price,
+                                       __ATOMIC_ACQUIRE);
+    if (current == 0U) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    *unit_price = current;
     return ESP_OK;
 }
 

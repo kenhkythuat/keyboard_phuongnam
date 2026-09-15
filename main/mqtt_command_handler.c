@@ -1121,7 +1121,9 @@ static esp_err_t publish_calibration_ack(const char *request_id,
     bool reported_built =
         cJSON_AddStringToObject(reported, "name", mapping->name) != NULL &&
         cJSON_AddStringToObject(reported, "command_echo",
-                                mapping->raw_command) != NULL;
+                                mapping->raw_command) != NULL &&
+        cJSON_AddStringToObject(reported, "mode_calibration",
+                                mapping->name) != NULL;
     bool root_built = reported_built &&
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
         cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
@@ -1667,6 +1669,18 @@ static void process_command(const command_message_t *message)
                 err = ESP_ERR_INVALID_RESPONSE;
             }
         }
+        char mode_readback[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+        if (err == ESP_OK) {
+            err = device_settings_set_mode_calibration(name->valuestring);
+        }
+        if (err == ESP_OK) {
+            err = device_settings_get_mode_calibration(
+                mode_readback, sizeof(mode_readback));
+            if (err == ESP_OK &&
+                strcmp(mode_readback, name->valuestring) != 0) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+        }
         if (err != ESP_OK) {
             const char *description;
             if (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_NOT_FOUND) {
@@ -1688,6 +1702,9 @@ static void process_command(const command_message_t *message)
             cJSON_Delete(root);
             return;
         }
+
+        ESP_LOGI(TAG, "Calibration da ap dung mode_calibration=%s",
+                 mode_readback);
 
         err = publish_calibration_ack(request_id->valuestring, &readback,
                                       slot);

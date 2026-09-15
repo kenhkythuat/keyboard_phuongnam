@@ -12,5 +12,5 @@
 
 #define MQTT_CLEAN_SESSION  1
 
-/* No decoded command-code source exists yet; replace when that flow is added. */
-#define TRANSACTION_COMMAND_CODE "P1E"
+/* Used until a successful calibration command stores another mode in NVS. */
+#define DEFAULT_MODE_CALIBRATION "P1E"

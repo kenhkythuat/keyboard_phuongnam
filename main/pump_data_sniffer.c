@@ -65,6 +65,7 @@
 #define COLUMN_CONFIRM_COUNT       2U
 #define BLANK_COLUMN_CONFIRM_COUNT 2U
 #define LIVE_BLANK_CONFIRM_COUNT   2U
+#define DISPLAY_CONFIRM_COUNT      2U
 
 /*
  * OUT8 và OUT9 của U2 không sử dụng trong schematic,
@@ -92,7 +93,7 @@ static int64_t s_column1_missing_since_us = 0;
 
 #define CAPTURE_YIELD_INTERVAL     16U
 #define REPORT_PERIOD_MS           500U
-#define ENABLE_PERIODIC_REPORT_LOG 1
+#define ENABLE_PERIODIC_REPORT_LOG 0
 
 #define INVALID_ASSEMBLY_OFFSET    0xFFU
 #define USE_FIXED_BIT_OFFSET       1
@@ -180,6 +181,8 @@ static uint32_t s_display_observation_generation = 0;
 
 static mbi_decode_result_t s_latest_candidate;
 static mbi_decode_result_t s_latest_display;
+static mbi_decode_result_t s_pending_complete_display;
+static uint8_t s_pending_complete_count;
 
 /* =========================================================
  * Bộ đệm ghép màn hình
@@ -200,6 +203,7 @@ static uint8_t s_offset_score[FRAME_BITS];
 #endif
 
 static void reset_display_assembly(void);
+static void reset_column_assembly(void);
 static void print_display_columns(
     const mbi_decode_result_t *display);
 static void format_display_row(
@@ -681,7 +685,7 @@ static void decode_locked_candidate(
 /* =========================================================
  * Xóa dữ liệu ghép màn hình
  * ========================================================= */
-static void reset_display_assembly(void)
+static void reset_column_assembly(void)
 {
     memset(
         s_assembly_u1,
@@ -701,6 +705,16 @@ static void reset_display_assembly(void)
         sizeof(s_assembly_confidence)
     );
 
+    s_assembly_confirmed_mask = 0;
+    s_assembly_bit_offset = INVALID_ASSEMBLY_OFFSET;
+    s_assembly_start_us = 0;
+    s_column1_missing_since_us = 0;
+}
+
+static void reset_display_assembly(void)
+{
+    reset_column_assembly();
+
     memset(
         s_live_display,
         0,
@@ -713,9 +727,13 @@ static void reset_display_assembly(void)
         sizeof(s_live_blank_confidence)
     );
 
-    s_assembly_confirmed_mask = 0;
-    s_assembly_bit_offset = INVALID_ASSEMBLY_OFFSET;
-    s_assembly_start_us = 0;
+    memset(
+        &s_pending_complete_display,
+        0,
+        sizeof(s_pending_complete_display)
+    );
+
+    s_pending_complete_count = 0U;
 }
 
 /* =========================================================
@@ -1109,6 +1127,34 @@ static void process_capture_sample(
     }
 
 #endif
+
+    if (display_completed) {
+        /*
+         * Khong tai su dung cot da confirmed cua anh truoc. Moi lan xac nhan
+         * toan man hinh phai bat dau lai voi du 6 cot moi, sau do hai anh
+         * hoan chinh lien tiep phai trung nhau moi duoc cong bo.
+         */
+        reset_column_assembly();
+
+        bool same_as_pending =
+            s_pending_complete_count > 0U &&
+            memcmp(s_pending_complete_display.display,
+                   complete_display.display,
+                   sizeof(complete_display.display)) == 0;
+
+        if (same_as_pending) {
+            if (s_pending_complete_count < DISPLAY_CONFIRM_COUNT) {
+                s_pending_complete_count++;
+            }
+        } else {
+            s_pending_complete_display = complete_display;
+            s_pending_complete_count = 1U;
+        }
+
+        if (s_pending_complete_count < DISPLAY_CONFIRM_COUNT) {
+            display_completed = false;
+        }
+    }
 
     portENTER_CRITICAL(&s_shared_lock);
 

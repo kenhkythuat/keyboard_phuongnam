@@ -19,6 +19,7 @@
 #include "pump_data_sniffer.h"
 #include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
+#include "telemetry_heartbeat.h"
 #include "time_manager.h"
 #include "virtual_key_output.h"
 #include "wifi_manager.h"
@@ -93,6 +94,7 @@ typedef enum {
 typedef struct {
     shortcut_output_type_t type;
     char sequence[SHORTCUT_PHYSICAL_KEY_MAX_LENGTH + 1U];
+    char mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 } shortcut_output_message_t;
 
 static SemaphoreHandle_t s_key_output_mutex;
@@ -629,6 +631,8 @@ static bool calibration_output_queue(
     };
     strlcpy(message.sequence, mapping->raw_command,
             sizeof(message.sequence));
+    strlcpy(message.mode_calibration, mapping->name,
+            sizeof(message.mode_calibration));
     if (xQueueSend(s_shortcut_output_queue, &message, 0) != pdTRUE) {
         ESP_LOGE(TAG, "Shortcut output queue day, bo qua calibration %s",
                  mapping->name);
@@ -650,6 +654,10 @@ static void shortcut_output_task(void *argument)
                 ESP_LOGI(TAG, "Bat dau calibration local: %s",
                          message.sequence);
                 err = execute_calibration_command(message.sequence);
+                if (err == ESP_OK) {
+                    err = device_settings_set_mode_calibration(
+                        message.mode_calibration);
+                }
             } else {
                 ESP_LOGI(TAG, "Bat dau phat shortcut: %s", message.sequence);
                 err = virtual_key_output_run_sequence(
@@ -1030,6 +1038,12 @@ void app_main(void)
         ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
     }
 
+    esp_err_t heartbeat_result = telemetry_heartbeat_start();
+    if (heartbeat_result != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry heartbeat init failed: %s",
+                 esp_err_to_name(heartbeat_result));
+    }
+
 #if ENABLE_PUMP_DATA_SNIFFER
     pump_data_sniffer_start();
 #endif
@@ -1118,6 +1132,12 @@ void app_main(void)
     esp_err_t mqtt_result = mqtt_manager_start();
     if (mqtt_result != ESP_OK) {
         ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
+    }
+
+    esp_err_t heartbeat_result = telemetry_heartbeat_start();
+    if (heartbeat_result != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry heartbeat init failed: %s",
+                 esp_err_to_name(heartbeat_result));
     }
 
 #if ENABLE_PUMP_DATA_SNIFFER
