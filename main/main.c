@@ -14,6 +14,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
+#include "device_config.h"
 #include "device_settings.h"
 #include "control_display_led.h"
 #include "pump_data_sniffer.h"
@@ -45,6 +46,8 @@ static const char *TAG = "KEY_OUTPUT";
 #define TOTALIZER_VIEW_POLL_MS         50U
 #define TOTALIZER_VIEW_TASK_STACK_SIZE 4096U
 #define TOTALIZER_VIEW_MAX_SEGMENTS    CONTROL_DISPLAY_COLUMNS
+#define WIFI_CONFIG_LED_POLL_MS        50U
+#define WIFI_CONFIG_LED_TASK_STACK_SIZE 3072U
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -97,12 +100,20 @@ typedef struct {
     char mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 } shortcut_output_message_t;
 
+typedef enum {
+    WIFI_STATUS_LED_NONE,
+    WIFI_STATUS_LED_CONFIG,
+    WIFI_STATUS_LED_DONE,
+    WIFI_STATUS_LED_FAIL,
+} wifi_status_led_view_t;
+
 static SemaphoreHandle_t s_key_output_mutex;
 static QueueHandle_t s_shortcut_output_queue;
 static bool s_virtual_output_active;
 static TaskHandle_t s_totalizer_view_task_handle;
 static bool s_totalizer_view_active;
 static bool s_totalizer_view_exit_requested;
+static wifi_status_led_view_t s_wifi_status_led_view;
 
 static void virtual_led_enable_init(void)
 {
@@ -771,10 +782,19 @@ static bool render_totalizer_display(
     return true;
 }
 
+static bool wifi_status_led_is_requested(void)
+{
+    wifi_manager_result_t result = wifi_manager_get_connection_result();
+    return wifi_manager_is_config_mode() ||
+           result == WIFI_MANAGER_RESULT_DONE ||
+           result == WIFI_MANAGER_RESULT_FAIL;
+}
+
 static bool totalizer_view_trigger(void)
 {
     bool expected = false;
     if (s_totalizer_view_task_handle == NULL ||
+        wifi_status_led_is_requested() ||
         !__atomic_compare_exchange_n(&s_totalizer_view_active, &expected, true,
                                      false, __ATOMIC_ACQ_REL,
                                      __ATOMIC_ACQUIRE)) {
@@ -861,6 +881,13 @@ static void totalizer_view_task(void *argument)
                              __ATOMIC_RELEASE);
             continue;
         }
+        if (wifi_status_led_is_requested() ||
+            __atomic_load_n(&s_totalizer_view_exit_requested,
+                            __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
         err = control_display_led_begin_virtual(display);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Khong bat duoc Virtual LED: %s",
@@ -887,17 +914,24 @@ static void totalizer_view_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(TOTALIZER_VIEW_POLL_MS));
         }
 
-        err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Khong tra duoc IO39 ve 0: %s",
-                     esp_err_to_name(err));
+        bool wifi_status_requested = wifi_status_led_is_requested();
+        if (!wifi_status_requested) {
+            err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Khong tra duoc IO39 ve 0: %s",
+                         esp_err_to_name(err));
+            }
+            control_display_led_end_virtual();
         }
-        control_display_led_end_virtual();
         __atomic_store_n(&s_totalizer_view_exit_requested, false,
                          __ATOMIC_RELEASE);
         __atomic_store_n(&s_totalizer_view_active, false,
                          __ATOMIC_RELEASE);
-        ESP_LOGI(TAG, "Thoat P88, IO39=0, tra man hinh ve mach ngoai");
+        if (wifi_status_requested) {
+            ESP_LOGI(TAG, "Thoat P88, giu quyen LED cho trang thai Wi-Fi");
+        } else {
+            ESP_LOGI(TAG, "Thoat P88, IO39=0, tra man hinh ve mach ngoai");
+        }
     }
 }
 
@@ -907,6 +941,146 @@ static esp_err_t totalizer_view_start(void)
                     TOTALIZER_VIEW_TASK_STACK_SIZE, NULL, 4,
                     &s_totalizer_view_task_handle) != pdPASS) {
         s_totalizer_view_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void wifi_status_led_task(void *argument)
+{
+    (void)argument;
+
+    static const uint8_t config_display
+        [CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS] = {
+        /* C, O, n, F, I, G */
+        {0x39U, 0x3FU, 0x54U, 0x71U, 0x06U, 0x6FU},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+    };
+    static const uint8_t done_display
+        [CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS] = {
+        /* d, o, n, E, centered on row 1. */
+        {0U, 0x5EU, 0x5CU, 0x54U, 0x79U, 0U},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+    };
+    static const uint8_t fail_display
+        [CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS] = {
+        /* F, A, i, L, centered on row 1. */
+        {0U, 0x71U, 0x77U, 0x30U, 0x38U, 0U},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+        {0U, 0U, 0U, 0U, 0U, 0U},
+    };
+
+    TickType_t result_display_started = 0;
+
+    while (true) {
+        bool config_mode = wifi_manager_is_config_mode();
+        wifi_manager_result_t connection_result =
+            wifi_manager_get_connection_result();
+        wifi_status_led_view_t desired_view = WIFI_STATUS_LED_NONE;
+        const uint8_t (*desired_segments)[CONTROL_DISPLAY_COLUMNS] = NULL;
+
+        if (connection_result == WIFI_MANAGER_RESULT_DONE) {
+            desired_view = WIFI_STATUS_LED_DONE;
+            desired_segments = done_display;
+        } else if (connection_result == WIFI_MANAGER_RESULT_FAIL) {
+            desired_view = WIFI_STATUS_LED_FAIL;
+            desired_segments = fail_display;
+        } else if (config_mode) {
+            desired_view = WIFI_STATUS_LED_CONFIG;
+            desired_segments = config_display;
+        }
+
+        wifi_status_led_view_t current_view = __atomic_load_n(
+            &s_wifi_status_led_view, __ATOMIC_ACQUIRE);
+        if (desired_view != current_view &&
+            desired_view != WIFI_STATUS_LED_NONE) {
+            if (__atomic_load_n(&s_totalizer_view_active,
+                                __ATOMIC_ACQUIRE)) {
+                totalizer_view_request_exit();
+            }
+
+            esp_err_t err = current_view == WIFI_STATUS_LED_NONE
+                                ? control_display_led_begin_virtual(
+                                      desired_segments)
+                                : control_display_led_set_virtual_segments(
+                                      desired_segments);
+            if (err == ESP_OK) {
+                err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 1);
+            }
+            if (err == ESP_OK) {
+                __atomic_store_n(&s_wifi_status_led_view, desired_view,
+                                 __ATOMIC_RELEASE);
+                if (desired_view == WIFI_STATUS_LED_CONFIG) {
+                    ESP_LOGI(TAG, "WiFi Config Mode: hien thi CONFIG, IO39=1");
+                } else {
+                    result_display_started = xTaskGetTickCount();
+                    if (desired_view == WIFI_STATUS_LED_DONE) {
+                        ESP_LOGI(TAG, "Kiem tra Wi-Fi: hien thi donE, IO39=1");
+                    } else {
+                        ESP_LOGI(TAG, "Kiem tra Wi-Fi: hien thi FAiL, IO39=1");
+                    }
+                }
+            } else {
+                if (current_view == WIFI_STATUS_LED_NONE) {
+                    control_display_led_end_virtual();
+                }
+                ESP_LOGE(TAG, "Khong hien thi duoc trang thai Wi-Fi: %s",
+                         esp_err_to_name(err));
+            }
+        } else if (desired_view != WIFI_STATUS_LED_NONE) {
+            esp_err_t err = control_display_led_set_virtual_segments(
+                desired_segments);
+            if (err != ESP_OK) {
+                __atomic_store_n(&s_wifi_status_led_view,
+                                 WIFI_STATUS_LED_NONE,
+                                 __ATOMIC_RELEASE);
+                ESP_LOGW(TAG, "Mat trang thai LED Wi-Fi, se khoi phuc: %s",
+                         esp_err_to_name(err));
+            }
+        } else if (current_view != WIFI_STATUS_LED_NONE) {
+            esp_err_t err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Khong tra duoc IO39 ve 0: %s",
+                         esp_err_to_name(err));
+            }
+            control_display_led_end_virtual();
+            __atomic_store_n(&s_wifi_status_led_view,
+                             WIFI_STATUS_LED_NONE,
+                             __ATOMIC_RELEASE);
+            ESP_LOGI(TAG, "Wi-Fi da ket noi, tat CONFIG va tra IO39=0");
+        }
+
+        current_view = __atomic_load_n(&s_wifi_status_led_view,
+                                       __ATOMIC_ACQUIRE);
+        if ((current_view == WIFI_STATUS_LED_DONE ||
+             current_view == WIFI_STATUS_LED_FAIL) &&
+            (xTaskGetTickCount() - result_display_started) >=
+                pdMS_TO_TICKS(WIFI_CONNECTION_RESULT_DISPLAY_MS)) {
+            esp_err_t err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Khong tra duoc IO39 ve 0: %s",
+                         esp_err_to_name(err));
+            }
+            control_display_led_end_virtual();
+            __atomic_store_n(&s_wifi_status_led_view,
+                             WIFI_STATUS_LED_NONE,
+                             __ATOMIC_RELEASE);
+
+            wifi_manager_acknowledge_connection_result();
+            ESP_LOGI(TAG, "Ket thuc thong bao Wi-Fi, tra IO39=0");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WIFI_CONFIG_LED_POLL_MS));
+    }
+}
+
+static esp_err_t wifi_status_led_start(void)
+{
+    if (xTaskCreate(wifi_status_led_task, "wifi_status_led",
+                    WIFI_CONFIG_LED_TASK_STACK_SIZE, NULL, 4,
+                    NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -1072,6 +1246,12 @@ void app_main(void)
     if (totalizer_view_result != ESP_OK) {
         ESP_LOGE(TAG, "Totalizer view init failed: %s",
                  esp_err_to_name(totalizer_view_result));
+    }
+
+    esp_err_t config_led_result = wifi_status_led_start();
+    if (config_led_result != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi config LED init failed: %s",
+                 esp_err_to_name(config_led_result));
     }
 
 #if ENABLE_AUTO_KEY_SEQUENCE
