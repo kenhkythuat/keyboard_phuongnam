@@ -25,6 +25,7 @@
 #define OTA_REQUEST_QUEUE_LENGTH     1U
 #define OTA_HTTP_TIMEOUT_MS          15000U
 #define OTA_MANIFEST_MAX_LENGTH      1024U
+#define OTA_MANIFEST_LOG_PREVIEW     160U
 #define OTA_URL_MAX_LENGTH           384U
 #define OTA_SELF_TEST_DELAY_MS       10000U
 #define OTA_REBOOT_DELAY_MS          2000U
@@ -157,6 +158,9 @@ static esp_err_t fetch_manifest(ota_manifest_t *manifest)
     int status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Manifest HTTP request failed: err=%s status=%d length=%u",
+                 esp_err_to_name(err), status_code, (unsigned)response.length);
         return err;
     }
     if (status_code != 200 || response.overflow || response.length == 0U) {
@@ -168,6 +172,11 @@ static esp_err_t fetch_manifest(ota_manifest_t *manifest)
 
     cJSON *root = cJSON_ParseWithLength(response.data, response.length);
     if (root == NULL || !cJSON_IsObject(root)) {
+        size_t preview_length = response.length < OTA_MANIFEST_LOG_PREVIEW
+                                    ? response.length
+                                    : OTA_MANIFEST_LOG_PREVIEW;
+        ESP_LOGE(TAG, "Manifest JSON khong hop le, body=%.*s",
+                 (int)preview_length, response.data);
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -176,12 +185,26 @@ static esp_err_t fetch_manifest(ota_manifest_t *manifest)
         cJSON_GetObjectItemCaseSensitive(root, "version");
     const cJSON *firmware_url =
         cJSON_GetObjectItemCaseSensitive(root, "firmware_url");
-    bool valid = cJSON_IsString(version) && version->valuestring != NULL &&
-                 strnlen(version->valuestring, sizeof(manifest->version)) <
-                     sizeof(manifest->version) &&
-                 cJSON_IsString(firmware_url) &&
-                 firmware_url_is_allowed(firmware_url->valuestring);
-    if (!valid) {
+    if (!cJSON_IsString(version) || version->valuestring == NULL) {
+        ESP_LOGE(TAG, "Manifest thieu field version hop le");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (strnlen(version->valuestring, sizeof(manifest->version)) >=
+        sizeof(manifest->version)) {
+        ESP_LOGE(TAG, "Manifest version qua dai");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!cJSON_IsString(firmware_url) || firmware_url->valuestring == NULL) {
+        ESP_LOGE(TAG, "Manifest thieu field firmware_url hop le");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!firmware_url_is_allowed(firmware_url->valuestring)) {
+        ESP_LOGE(TAG, "Manifest firmware_url khong khop");
+        ESP_LOGE(TAG, "  expected: %s", OTA_FIRMWARE_URL);
+        ESP_LOGE(TAG, "  received: %s", firmware_url->valuestring);
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -194,6 +217,8 @@ static esp_err_t fetch_manifest(ota_manifest_t *manifest)
 
     uint32_t parsed[OTA_VERSION_PART_COUNT];
     if (!parse_version(manifest->version, parsed)) {
+        ESP_LOGE(TAG, "Manifest version khong hop le: %s",
+                 manifest->version);
         return ESP_ERR_INVALID_VERSION;
     }
     return ESP_OK;
