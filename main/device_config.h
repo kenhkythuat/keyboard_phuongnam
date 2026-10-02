@@ -18,7 +18,7 @@
 
 /* Public GitHub Raw release files. Private repositories require authentication. */
 #define OTA_MANIFEST_URL \
-    "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/main/OTA/version.json"
+    "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/feature/control_kepad/OTA/version.json"
 #define OTA_FIRMWARE_URL_PREFIX \
     "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/"
 
