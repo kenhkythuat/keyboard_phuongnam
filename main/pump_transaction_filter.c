@@ -172,6 +172,15 @@ static bool command_code_is_valid(const char *command_code)
     return true;
 }
 
+static bool transaction_values_equal(const pump_transaction_t *left,
+                                     const pump_transaction_t *right)
+{
+    return left != NULL && right != NULL &&
+           left->amount_vnd == right->amount_vnd &&
+           left->volume_ml == right->volume_ml &&
+           left->unit_price == right->unit_price;
+}
+
 static esp_err_t publish_transaction_telemetry(
     const pump_transaction_t *transaction,
     const time_manager_snapshot_t *time_snapshot,
@@ -349,11 +358,15 @@ static void pump_transaction_filter_task(void *argument)
     pump_display_message_t message;
     pump_transaction_t latest_transaction = {0};
     pump_transaction_t previous_positive_transaction = {0};
+    pump_transaction_t idle_positive_transaction = {0};
+    pump_transaction_t pre_start_transaction = {0};
     char active_command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U] = {0};
     bool transaction_active = false;
     bool has_sale_data = false;
     bool has_positive_sample = false;
     bool progressive_increase_seen = false;
+    bool has_idle_positive_transaction = false;
+    bool has_pre_start_transaction = false;
     TickType_t last_display_tick = 0;
     const TickType_t stable_ticks = pdMS_TO_TICKS(PUMP_DATA_STABLE_TIME_MS);
     const TickType_t pending_retry_ticks = pdMS_TO_TICKS(PENDING_RETRY_MS);
@@ -438,6 +451,13 @@ static void pump_transaction_filter_task(void *argument)
                 has_sale_data = false;
                 has_positive_sample = false;
                 progressive_increase_seen = false;
+                has_pre_start_transaction = has_idle_positive_transaction;
+                if (has_pre_start_transaction) {
+                    pre_start_transaction = idle_positive_transaction;
+                } else {
+                    memset(&pre_start_transaction, 0,
+                           sizeof(pre_start_transaction));
+                }
                 latest_transaction = transaction;
                 memset(&previous_positive_transaction, 0,
                        sizeof(previous_positive_transaction));
@@ -451,6 +471,11 @@ static void pump_transaction_filter_task(void *argument)
             }
 
             if (!transaction_active) {
+                if (transaction.amount_vnd > 0U &&
+                    transaction.volume_ml > 0U) {
+                    idle_positive_transaction = transaction;
+                    has_idle_positive_transaction = true;
+                }
                 continue;
             }
 
@@ -469,14 +494,43 @@ static void pump_transaction_filter_task(void *argument)
                 previous_positive_transaction = transaction;
                 latest_transaction = transaction;
                 has_positive_sample = true;
-                has_sale_data = false;
-                ESP_LOGI(
-                    TAG,
-                    "Nhan mau bom duong dau tien: amount=%" PRIu32
-                    " volume=%" PRIu32 ", cho buoc tang tiep theo",
-                    transaction.amount_vnd,
-                    transaction.volume_ml
-                );
+                bool restored_previous_display =
+                    has_pre_start_transaction &&
+                    transaction_values_equal(&transaction,
+                                             &pre_start_transaction);
+                bool differs_from_pre_start =
+                    has_pre_start_transaction &&
+                    !restored_previous_display;
+                has_sale_data = differs_from_pre_start;
+
+                if (restored_previous_display) {
+                    ESP_LOGW(
+                        TAG,
+                        "Mau duong dau tien trung man hinh truoc luc ve 0: "
+                        "amount=%" PRIu32 " volume=%" PRIu32
+                        ", tam coi la du lieu cu duoc khoi phuc",
+                        transaction.amount_vnd,
+                        transaction.volume_ml
+                    );
+                } else if (!has_pre_start_transaction) {
+                    ESP_LOGI(
+                        TAG,
+                        "Nhan mau bom duong dau tien: amount=%" PRIu32
+                        " volume=%" PRIu32
+                        ", chua co man hinh truoc luc ve 0 nen cho buoc tang",
+                        transaction.amount_vnd,
+                        transaction.volume_ml
+                    );
+                } else {
+                    ESP_LOGI(
+                        TAG,
+                        "Nhan mau bom duong dau tien moi: amount=%" PRIu32
+                        " volume=%" PRIu32
+                        ", cho on dinh hoac buoc tang tiep theo",
+                        transaction.amount_vnd,
+                        transaction.volume_ml
+                    );
+                }
                 continue;
             }
 
@@ -520,7 +574,12 @@ static void pump_transaction_filter_task(void *argument)
 
             previous_positive_transaction = transaction;
             latest_transaction = transaction;
-            has_sale_data = progressive_increase_seen;
+            bool differs_from_pre_start =
+                has_pre_start_transaction &&
+                !transaction_values_equal(&transaction,
+                                          &pre_start_transaction);
+            has_sale_data = progressive_increase_seen ||
+                            differs_from_pre_start;
             continue;
         }
 
@@ -551,13 +610,19 @@ static void pump_transaction_filter_task(void *argument)
             }
         }
 
+        idle_positive_transaction = latest_transaction;
+        has_idle_positive_transaction = true;
+
         transaction_active = false;
         has_sale_data = false;
         has_positive_sample = false;
         progressive_increase_seen = false;
+        has_pre_start_transaction = false;
         memset(&latest_transaction, 0, sizeof(latest_transaction));
         memset(&previous_positive_transaction, 0,
                sizeof(previous_positive_transaction));
+        memset(&pre_start_transaction, 0,
+               sizeof(pre_start_transaction));
         memset(active_command_code, 0, sizeof(active_command_code));
     }
 }
