@@ -18,6 +18,7 @@
 
 #include "device_config.h"
 #include "device_settings.h"
+#include "firmware_version.h"
 #include "wifi_manager.h"
 
 #define OTA_TASK_STACK_SIZE          10240U
@@ -438,6 +439,5 @@ bool ota_manager_is_busy(void)
 
 const char *ota_manager_get_current_version(void)
 {
-    const esp_app_desc_t *description = esp_app_get_description();
-    return description != NULL ? description->version : "0.0.0";
+    return firmware_version_get();
 }

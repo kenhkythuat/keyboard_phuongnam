@@ -287,10 +287,15 @@ Chúng hiện trả `result=rejected`, `description=unsupported_command`.
 
 Topic: `tbmq/keyboard/<node_id>/telemetry`.
 
+Field `version` cua moi telemetry lay tu app descriptor qua
+`firmware_version_get()`. Day cung la version OTA duoc sinh tu `PROJECT_VER`;
+khong con hard-code `1.3` trong telemetry. Version `1.3` chi con la schema cua
+command/ACK.
+
 ```json
 {
   "ts": 1789369621,
-  "version": "1.3",
+  "version": "1.0.5",
   "data": {
     "unit_price": 25000,
     "amount_vnd": 7850,
@@ -306,7 +311,7 @@ Topic: `tbmq/keyboard/<node_id>/telemetry`.
 | Field | Kiểu | Đơn vị / quy tắc |
 |---|---|---|
 | `ts` | integer 64-bit | Unix UTC giây |
-| `version` | string | `1.3` |
+| `version` | string | firmware `PROJECT_VER`, cung gia tri voi OTA app version |
 | `unit_price` | number | VNĐ/L |
 | `amount_vnd` | number | VNĐ |
 | `volume_ml` | number | mL |
@@ -331,7 +336,7 @@ Nếu chưa đủ điều kiện mạng/time, lưu tối đa 32 giao dịch vào
 ```json
 {
   "ts": 1786523009,
-  "version": "1.3",
+  "version": "1.0.5",
   "data": {
     "total_amount_vnd": 125400000,
     "total_volume_l": 5016.2,
@@ -347,7 +352,7 @@ Chu kỳ 60 giây:
 ```json
 {
   "ts": 1786522928,
-  "version": "1.3",
+  "version": "1.0.5",
   "keep_alive": 1,
   "RSSI": -75,
   "data": {

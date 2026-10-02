@@ -14,6 +14,7 @@
 
 #include "device_config.h"
 #include "device_settings.h"
+#include "firmware_version.h"
 #include "mqtt_manager.h"
 #include "pump_transaction_store.h"
 #include "time_manager.h"
@@ -200,7 +201,8 @@ static esp_err_t publish_transaction_telemetry(
     }
 
     if (cJSON_AddNumberToObject(root, "ts", (double)time_snapshot->ts) == NULL ||
-        cJSON_AddStringToObject(root, "version", "1.3") == NULL) {
+        cJSON_AddStringToObject(root, "version",
+                               firmware_version_get()) == NULL) {
 
         cJSON_Delete(root);
         cJSON_Delete(data);

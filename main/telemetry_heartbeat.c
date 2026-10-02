@@ -2,7 +2,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,6 +9,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 
+#include "firmware_version.h"
 #include "mqtt_manager.h"
 #include "pump_transaction_filter.h"
 #include "time_manager.h"
@@ -18,7 +18,6 @@
 #define TELEMETRY_HEARTBEAT_PERIOD_MS       60000U
 #define TELEMETRY_HEARTBEAT_TASK_STACK_SIZE 3072U
 #define TELEMETRY_HEARTBEAT_TASK_PRIORITY   3U
-#define TELEMETRY_HEARTBEAT_VERSION         "1.3"
 #define TELEMETRY_HEARTBEAT_VALUE           1
 #define WIFI_RSSI_MIN_DBM                   (-127)
 #define WIFI_RSSI_MAX_DBM                   0
@@ -26,17 +25,9 @@
 static const char *TAG = "TELEMETRY_HEARTBEAT";
 static bool s_started;
 
-static bool version_is_valid(void)
-{
-    return strcmp(TELEMETRY_HEARTBEAT_VERSION, "1.3") == 0;
-}
-
 static esp_err_t publish_heartbeat(void)
 {
-    if (!version_is_valid()) {
-        ESP_LOGE(TAG, "Telemetry version khong hop le");
-        return ESP_ERR_INVALID_VERSION;
-    }
+    const char *firmware_version = firmware_version_get();
 
     int64_t timestamp = time_manager_get_timestamp();
     if (timestamp <= 0) {
@@ -79,7 +70,7 @@ static esp_err_t publish_heartbeat(void)
     bool root_built = data_built &&
         cJSON_AddNumberToObject(root, "ts", (double)timestamp) != NULL &&
         cJSON_AddStringToObject(root, "version",
-                                TELEMETRY_HEARTBEAT_VERSION) != NULL &&
+                                firmware_version) != NULL &&
         cJSON_AddNumberToObject(root, "keep_alive",
                                TELEMETRY_HEARTBEAT_VALUE) != NULL &&
         cJSON_AddNumberToObject(root, "RSSI", rssi) != NULL;
@@ -101,7 +92,7 @@ static esp_err_t publish_heartbeat(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Heartbeat queued: ts=%lld version=%s keep_alive=%d "
                       "RSSI=%d dBm unit_price=%lu",
-                 (long long)timestamp, TELEMETRY_HEARTBEAT_VERSION,
+                 (long long)timestamp, firmware_version,
                  TELEMETRY_HEARTBEAT_VALUE, (int)rssi,
                  (unsigned long)unit_price);
     } else {

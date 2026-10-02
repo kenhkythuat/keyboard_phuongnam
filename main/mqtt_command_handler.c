@@ -17,6 +17,7 @@
 #include "esp_log.h"
 
 #include "device_settings.h"
+#include "firmware_version.h"
 #include "mqtt_manager.h"
 #include "ota_manager.h"
 #include "pump_data_sniffer.h"
@@ -43,6 +44,7 @@
 #define CALIBRATION_ENTRY_SEQUENCE "C#122973E"
 #define CALIBRATION_MAX_ATTEMPTS   3U
 #define CALIBRATION_RAW_COMMAND_DELAY_MS 1000U
+#define MQTT_PROTOCOL_VERSION          "1.3"
 
 typedef struct {
     size_t length;
@@ -808,7 +810,8 @@ static esp_err_t publish_totalizer_telemetry(uint64_t total_amount_vnd,
 
     bool built =
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
-        cJSON_AddStringToObject(root, "version", "1.3") != NULL;
+        cJSON_AddStringToObject(root, "version",
+                               firmware_version_get()) != NULL;
     bool data_attached = built && cJSON_AddItemToObject(root, "data", data);
     built = data_attached &&
         cJSON_AddNumberToObject(data, "total_amount_vnd",
@@ -934,7 +937,8 @@ static esp_err_t publish_ack(const char *request_id,
 
     bool built =
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
-        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               MQTT_PROTOCOL_VERSION) != NULL &&
         cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
         cJSON_AddStringToObject(root, "ack_to", command) != NULL &&
         cJSON_AddStringToObject(root, "result", result) != NULL &&
@@ -1004,7 +1008,8 @@ static esp_err_t publish_shortcut_mapping_ack(
                                                  revision) != NULL;
     bool root_built = reported_built &&
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
-        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               MQTT_PROTOCOL_VERSION) != NULL &&
         cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
         cJSON_AddStringToObject(root, "ack_to",
                                "set_shortcut_mapping") != NULL &&
@@ -1065,7 +1070,8 @@ static esp_err_t publish_price_edit_lock_ack(const char *request_id,
         reported, "price_edit_locked", price_edit_locked) != NULL;
     bool root_built = reported_built &&
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
-        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               MQTT_PROTOCOL_VERSION) != NULL &&
         cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
         cJSON_AddStringToObject(root, "ack_to",
                                "set_price_edit_lock") != NULL &&
@@ -1127,7 +1133,8 @@ static esp_err_t publish_calibration_ack(const char *request_id,
                                 mapping->name) != NULL;
     bool root_built = reported_built &&
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
-        cJSON_AddStringToObject(root, "version", "1.3") != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               MQTT_PROTOCOL_VERSION) != NULL &&
         cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
         cJSON_AddStringToObject(root, "ack_to",
                                "send_calibration_command") != NULL &&
@@ -1199,12 +1206,13 @@ static void process_command(const command_message_t *message)
                            floor(timestamp->valuedouble) == timestamp->valuedouble;
     bool envelope_valid = timestamp_valid &&
                           cJSON_IsString(version) &&
-                          strcmp(version->valuestring, "1.3") == 0 &&
+                          strcmp(version->valuestring,
+                                 MQTT_PROTOCOL_VERSION) == 0 &&
                           cJSON_IsObject(param);
     bool reset_totalizer_envelope_valid =
         (timestamp == NULL || timestamp_valid) &&
         cJSON_IsString(version) &&
-        strcmp(version->valuestring, "1.3") == 0 &&
+        strcmp(version->valuestring, MQTT_PROTOCOL_VERSION) == 0 &&
         cJSON_IsObject(param);
 
     if (strcmp(command->valuestring, "OTA") == 0) {

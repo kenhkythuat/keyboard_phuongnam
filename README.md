@@ -29,7 +29,7 @@ File [FIRMWARE_ARCHITECTURE.md](FIRMWARE_ARCHITECTURE.md) là tài liệu cũ v�
 | Framework | ESP-IDF 5.3.x |
 | RTOS | FreeRTOS |
 | Flash | 8 MB |
-| MQTT payload | JSON UTF-8, version `1.3` |
+| MQTT payload | JSON UTF-8; command/ACK schema `1.3`, telemetry version = firmware `PROJECT_VER` |
 | Timezone thiết bị | `Asia/Ho_Chi_Minh` qua TZ `ICT-7` |
 | NTP server | `pool.ntp.org` |
 | Node mặc định | `node_kbd_001` |

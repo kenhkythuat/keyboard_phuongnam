@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "device_settings.c"
+        "firmware_version.c"
         "wifi_manager.c"
         "wifi_config_portal.c"
         "mqtt_manager.c"
