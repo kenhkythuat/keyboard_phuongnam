@@ -266,7 +266,7 @@ Ví dụ manifest:
 ```json
 {
   "version": "1.0.1",
-  "firmware_url": "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/main/OTA/file.bin",
+  "firmware_url": "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/<OTA_RELEASE_BRANCH>/OTA/file.bin",
   "size": 1161376
 }
 ```
@@ -404,7 +404,7 @@ Quy trình xuất xưởng:
 
 1. Tăng `PROJECT_VER` trong root `CMakeLists.txt`.
 2. Chạy `idf.py build`.
-3. Chạy `python tools/prepare_ota.py`.
+3. Chạy `python tools/prepare_ota.py --branch <OTA_RELEASE_BRANCH>`.
 4. Kiểm tra version trong `OTA/version.json` trùng app version vừa build.
 5. Commit/push `OTA/file.bin` và `OTA/version.json` lên nhánh `main` cùng một lần.
 6. Gửi command `OTA` và theo dõi log `OTA_MANAGER` qua lần reboot/self-test.

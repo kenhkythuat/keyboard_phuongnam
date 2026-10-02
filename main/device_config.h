@@ -17,10 +17,13 @@
 #define MQTT_CLEAN_SESSION  1
 
 /* Public GitHub Raw release files. Private repositories require authentication. */
-#define OTA_MANIFEST_URL \
-    "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/feature/control_kepad/OTA/version.json"
-#define OTA_FIRMWARE_URL_PREFIX \
+#define OTA_GITHUB_RAW_BASE \
     "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/"
+#define OTA_RELEASE_BRANCH "feature/control_kepad"
+#define OTA_MANIFEST_URL \
+    OTA_GITHUB_RAW_BASE OTA_RELEASE_BRANCH "/OTA/version.json"
+#define OTA_FIRMWARE_URL \
+    OTA_GITHUB_RAW_BASE OTA_RELEASE_BRANCH "/OTA/file.bin"
 
 /* Factory Wi-Fi seed copied to NVS when credentials have not been saved yet. */
 #define WIFI_DEFAULT_SSID              "Technical IOT"

@@ -131,10 +131,7 @@ static int compare_versions(const char *left, const char *right,
 
 static bool firmware_url_is_allowed(const char *url)
 {
-    size_t prefix_length = strlen(OTA_FIRMWARE_URL_PREFIX);
-    return url != NULL &&
-           strncmp(url, OTA_FIRMWARE_URL_PREFIX, prefix_length) == 0 &&
-           strnlen(url, OTA_URL_MAX_LENGTH) < OTA_URL_MAX_LENGTH;
+    return url != NULL && strcmp(url, OTA_FIRMWARE_URL) == 0;
 }
 
 static esp_err_t fetch_manifest(ota_manifest_t *manifest)
@@ -211,6 +208,7 @@ static esp_err_t download_and_install(const ota_manifest_t *manifest)
         return ESP_ERR_NOT_FOUND;
     }
 
+    ESP_LOGI(TAG, "Tai OTA firmware: %s", manifest->firmware_url);
     esp_http_client_config_t http_config = {
         .url = manifest->firmware_url,
         .crt_bundle_attach = esp_crt_bundle_attach,

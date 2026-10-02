@@ -306,11 +306,11 @@ Mở ESP-IDF terminal rồi chạy:
 ```powershell
 idf.py set-target esp32s3
 idf.py build
-python tools/prepare_ota.py
+python tools/prepare_ota.py --branch feature/control_kepad
 idf.py -p COMx flash monitor
 ```
 
-Mỗi release phải tăng `PROJECT_VER` trong `CMakeLists.txt`, build lại, chạy `tools/prepare_ota.py`, rồi commit/push đồng thời `OTA/file.bin` và `OTA/version.json` lên nhánh `main`. Không publish manifest mới trước binary tương ứng.
+Mỗi release phải tăng `PROJECT_VER` trong `CMakeLists.txt`, build lại, chạy `tools/prepare_ota.py --branch <OTA_RELEASE_BRANCH>`, rồi commit/push đồng thời `OTA/file.bin` và `OTA/version.json` lên đúng nhánh cấu hình tại `OTA_RELEASE_BRANCH` trong `main/device_config.h`. Không publish manifest mới trước binary tương ứng.
 
 Không commit credential production vào source. Trước khi nhân bản board phải đổi `NODE_ID` thành giá trị duy nhất trong khoảng `node_kbd_001` đến `node_kbd_999`.
 
