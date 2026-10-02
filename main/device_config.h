@@ -1,6 +1,10 @@
 #pragma once
 
-/* Must be unique for every physical board: node_kbd_001 .. node_kbd_999. */
+/*
+ * Factory seed values. On first boot they are copied to NVS. Later firmware
+ * builds and OTA updates load NVS and do not overwrite provisioned values.
+ * NODE_ID must be unique for every board: node_kbd_001 .. node_kbd_999.
+ */
 #define NODE_ID             "node_kbd_001"
 
 #define MQTT_BROKER_HOST    "161.248.146.170"
@@ -12,7 +16,7 @@
 
 #define MQTT_CLEAN_SESSION  1
 
-/* Factory fallback used only when Wi-Fi credentials have not been saved yet. */
+/* Factory Wi-Fi seed copied to NVS when credentials have not been saved yet. */
 #define WIFI_DEFAULT_SSID              "Technical IOT"
 #define WIFI_DEFAULT_PASSWORD          "123456789"
 

@@ -68,6 +68,8 @@ static bool s_trial_active;
 static bool s_ignore_next_disconnect;
 static wifi_manager_result_t s_connection_result;
 
+static esp_err_t save_credentials(const wifi_credentials_t *credentials);
+
 _Static_assert(sizeof(WIFI_DEFAULT_SSID) - 1U <= WIFI_SSID_MAX_LENGTH,
                "WIFI_DEFAULT_SSID is too long");
 _Static_assert(sizeof(WIFI_DEFAULT_PASSWORD) - 1U <= WIFI_PASSWORD_MAX_LENGTH,
@@ -118,17 +120,32 @@ static void load_factory_credentials(wifi_credentials_t *credentials)
             sizeof(credentials->password));
 }
 
+static esp_err_t seed_factory_credentials(void)
+{
+    load_factory_credentials(&s_active_credentials);
+    s_have_credentials = credentials_are_valid(&s_active_credentials);
+    s_credentials_persisted = false;
+    if (!s_have_credentials) {
+        ESP_LOGI(TAG, "Chua co Wi-Fi trong NVS va factory SSID rong");
+        return ESP_OK;
+    }
+
+    esp_err_t err = save_credentials(&s_active_credentials);
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_credentials_persisted = true;
+    ESP_LOGI(TAG, "Da seed Wi-Fi factory vao NVS, SSID=%s",
+             s_active_credentials.ssid);
+    return ESP_OK;
+}
+
 static esp_err_t load_credentials(void)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WIFI_CREDENTIAL_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        load_factory_credentials(&s_active_credentials);
-        s_have_credentials = credentials_are_valid(&s_active_credentials);
-        s_credentials_persisted = false;
-        ESP_LOGI(TAG, "Chua co Wi-Fi trong NVS, dung cau hinh firmware%s",
-                 s_have_credentials ? "" : " (SSID rong)");
-        return ESP_OK;
+        return seed_factory_credentials();
     }
     if (err != ESP_OK) {
         return err;
@@ -139,13 +156,8 @@ static esp_err_t load_credentials(void)
     err = nvs_get_blob(handle, WIFI_CREDENTIAL_KEY, &store, &size);
     nvs_close(handle);
 
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        load_factory_credentials(&s_active_credentials);
-        s_have_credentials = credentials_are_valid(&s_active_credentials);
-        s_credentials_persisted = false;
-        ESP_LOGI(TAG, "Chua co Wi-Fi trong NVS, dung cau hinh firmware%s",
-                 s_have_credentials ? "" : " (SSID rong)");
-        return ESP_OK;
+    if (err == ESP_ERR_NVS_NOT_FOUND || err == ESP_ERR_NVS_INVALID_LENGTH) {
+        return seed_factory_credentials();
     }
     if (err != ESP_OK) {
         return err;
@@ -154,10 +166,7 @@ static esp_err_t load_credentials(void)
         store.version != WIFI_CREDENTIAL_VERSION ||
         !credentials_are_valid(&store.credentials)) {
         ESP_LOGW(TAG, "Wi-Fi credential trong NVS khong hop le, dung cau hinh firmware");
-        load_factory_credentials(&s_active_credentials);
-        s_have_credentials = credentials_are_valid(&s_active_credentials);
-        s_credentials_persisted = false;
-        return ESP_OK;
+        return seed_factory_credentials();
     }
 
     s_active_credentials = store.credentials;

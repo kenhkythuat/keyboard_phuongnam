@@ -15,6 +15,7 @@
 #include "mqtt_client.h"
 
 #include "device_config.h"
+#include "device_settings.h"
 #include "wifi_manager.h"
 
 #define MQTT_CONNECTED_BIT              BIT0
@@ -36,22 +37,24 @@ static uint32_t s_reconnect_delay_ms = MQTT_RECONNECT_INITIAL_MS;
 static bool s_client_started;
 static bool s_initialized;
 static int s_command_subscribe_message_id = -1;
+static device_core_config_t s_runtime_config;
 
 static char s_telemetry_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_command_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_ack_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_event_topic[MQTT_TOPIC_BUFFER_SIZE];
 
-static bool node_id_is_valid(void)
+static bool node_id_is_valid(const char *node_id)
 {
     static const char prefix[] = "node_kbd_";
 
-    if (strncmp(NODE_ID, prefix, sizeof(prefix) - 1U) != 0 ||
-        strlen(NODE_ID) != (sizeof(prefix) - 1U) + 3U) {
+    if (node_id == NULL ||
+        strncmp(node_id, prefix, sizeof(prefix) - 1U) != 0 ||
+        strlen(node_id) != (sizeof(prefix) - 1U) + 3U) {
         return false;
     }
 
-    const char *number = NODE_ID + sizeof(prefix) - 1U;
+    const char *number = node_id + sizeof(prefix) - 1U;
     if (number[0] < '0' || number[0] > '9' ||
         number[1] < '0' || number[1] > '9' ||
         number[2] < '0' || number[2] > '9') {
@@ -70,7 +73,7 @@ static esp_err_t build_topic(char *buffer, size_t size, const char *direction)
         buffer,
         size,
         "tbmq/keyboard/%s/%s",
-        NODE_ID,
+        s_runtime_config.node_id,
         direction
     );
 
@@ -107,13 +110,16 @@ static esp_err_t build_topics(void)
 
 static esp_err_t validate_configuration(void)
 {
-    if (!node_id_is_valid()) {
-        ESP_LOGE(TAG, "NODE_ID khong hop le: %s", NODE_ID);
+    if (!device_settings_core_config_is_valid(&s_runtime_config) ||
+        !node_id_is_valid(s_runtime_config.node_id)) {
+        ESP_LOGE(TAG, "Core MQTT config trong NVS khong hop le");
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (MQTT_USERNAME[0] == '\0' || MQTT_PASSWORD[0] == '\0') {
-        ESP_LOGE(TAG, "MQTT credential cho %s chua duoc cau hinh", NODE_ID);
+    if (s_runtime_config.mqtt_username[0] == '\0' ||
+        s_runtime_config.mqtt_password[0] == '\0') {
+        ESP_LOGE(TAG, "MQTT credential cho %s chua duoc cau hinh",
+                 s_runtime_config.node_id);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -168,7 +174,8 @@ static void request_connection(void)
         err = esp_mqtt_client_start(s_client);
         if (err == ESP_OK) {
             s_client_started = true;
-            ESP_LOGI(TAG, "MQTT client started: %s", NODE_ID);
+            ESP_LOGI(TAG, "MQTT client started: %s",
+                     s_runtime_config.node_id);
             return;
         }
     } else {
@@ -336,12 +343,19 @@ esp_err_t mqtt_manager_start(void)
         return ESP_OK;
     }
 
-    esp_err_t err = build_topics();
+    esp_err_t err = device_settings_get_core_config(&s_runtime_config);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Khong doc duoc core MQTT config tu NVS: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
     err = validate_configuration();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = build_topics();
     if (err != ESP_OK) {
         return err;
     }
@@ -365,12 +379,12 @@ esp_err_t mqtt_manager_start(void)
     }
 
     esp_mqtt_client_config_t config = {
-        .broker.address.hostname = MQTT_BROKER_HOST,
-        .broker.address.port = MQTT_BROKER_PORT,
+        .broker.address.hostname = s_runtime_config.mqtt_broker_host,
+        .broker.address.port = s_runtime_config.mqtt_broker_port,
         .broker.address.transport = MQTT_TRANSPORT_OVER_TCP,
-        .credentials.username = MQTT_USERNAME,
-        .credentials.client_id = NODE_ID,
-        .credentials.authentication.password = MQTT_PASSWORD,
+        .credentials.username = s_runtime_config.mqtt_username,
+        .credentials.client_id = s_runtime_config.node_id,
+        .credentials.authentication.password = s_runtime_config.mqtt_password,
         .session.disable_clean_session = MQTT_CLEAN_SESSION ? false : true,
         .session.keepalive = MQTT_KEEPALIVE_SECONDS,
         .network.disable_auto_reconnect = true,
@@ -417,7 +431,10 @@ esp_err_t mqtt_manager_start(void)
 
     s_initialized = true;
 
-    ESP_LOGI(TAG, "MQTT manager initialized, client_id=%s", NODE_ID);
+    ESP_LOGI(TAG, "MQTT manager initialized, client_id=%s broker=%s:%u",
+             s_runtime_config.node_id,
+             s_runtime_config.mqtt_broker_host,
+             (unsigned)s_runtime_config.mqtt_broker_port);
     ESP_LOGI(TAG, "Telemetry topic: %s", s_telemetry_topic);
     ESP_LOGI(TAG, "Command topic: %s", s_command_topic);
     ESP_LOGI(TAG, "ACK topic: %s", s_ack_topic);

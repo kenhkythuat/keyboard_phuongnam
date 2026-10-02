@@ -10,18 +10,18 @@ ESP32-S3 đóng vai trò cầu nối giữa bàn phím/màn hình của bộ đi
 - nhận command đúng namespace của Node;
 - giữ cấu hình và giao dịch pending trong NVS.
 
-Nguồn chuẩn của cấu hình thiết bị là `main/device_config.h`. Không sao chép `NODE_ID`, broker hoặc credential sang module khác.
+Nguồn runtime của cấu hình thiết bị là NVS `device_cfg/core_cfg`. `main/device_config.h` chỉ là factory seed cho lần boot đầu tiên. Không sao chép `NODE_ID`, broker hoặc credential sang module khác.
 
 ## 2. Định danh và kết nối MQTT
 
-`NODE_ID` phải có dạng `node_kbd_NNN`, với `NNN` từ `001` đến `999`. MQTT Client ID dùng chính `NODE_ID`.
+`node_id` phải có dạng `node_kbd_NNN`, với `NNN` từ `001` đến `999`. MQTT Client ID dùng chính `node_id` đã load từ NVS.
 
 | Thuộc tính | Giá trị code hiện tại |
 |---|---|
-| Broker host | cấu hình trong `MQTT_BROKER_HOST` |
-| Port | `1883` |
+| Broker host | `core_cfg.mqtt_broker_host` |
+| Port | `core_cfg.mqtt_broker_port`; factory seed hiện là `1883` |
 | Transport | `MQTT_TRANSPORT_OVER_TCP` |
-| Username/password | `MQTT_USERNAME`, `MQTT_PASSWORD` |
+| Username/password | `core_cfg.mqtt_username`, `core_cfg.mqtt_password` |
 | QoS | 1 |
 | Retain | false |
 | Keep alive | 60 giây |
@@ -119,9 +119,9 @@ Các `result` hiện dùng: `ok`, `error`, `rejected`.
 {"param":{"locked":true}}
 ```
 
-- Hiện mới lưu RAM trong `s_price_edit_locked`.
+- Lưu NVS `device_cfg/price_lock` và readback trước khi ACK `ok`.
 - Chưa nối vào logic khóa thao tác đổi giá.
-- Mất trạng thái sau reboot.
+- Giữ trạng thái qua reboot và OTA app.
 - ACK thành công: `price_edit_lock_updated`, reported `price_edit_locked`.
 
 ### 6.3 `set_unit_price`
@@ -348,18 +348,27 @@ SSID tối đa 32 byte; password tối đa 64 byte ở form. Credential cũ ch�
 | Namespace/key | Kiểu | Giới hạn |
 |---|---|---|
 | `wifi_cfg/credentials` | blob có magic/version | 1 credential |
+| `device_cfg/core_cfg` | versioned blob | node ID + MQTT host/port/credential |
 | `device_cfg/hash_lock` | u8 | boolean |
+| `device_cfg/price_lock` | u8 | boolean |
 | `device_cfg/cal_mode` | string | 16 ký tự |
 | `device_cfg/shortcuts` | versioned blob | 10 slot + revision |
 | `device_cfg/calib_map` | versioned blob | 5 slot |
 | `pump_tx/queue` | versioned blob | 32 giao dịch |
 
-Các blob có magic/version và một số luồng migration từ version cũ.
+Các blob có magic/version và một số luồng migration từ version cũ. `core_cfg` được seed từ `device_config.h` nếu chưa tồn tại hoặc không hợp lệ. MQTT không log password.
+
+Quy trình xuất xưởng:
+
+1. Đặt factory seed riêng cho board trong `device_config.h`, đặc biệt `NODE_ID` duy nhất.
+2. Build và flash firmware lần đầu.
+3. Boot đầu seed `core_cfg`, Wi-Fi, lock, mode và bảng mapping rỗng vào NVS, sau đó readback.
+4. Mọi thay đổi qua API/command phải commit và readback NVS trước khi báo thành công.
+5. Reboot hoặc OTA app load lại NVS; factory seed mới trong binary không ghi đè cấu hình đã provision.
 
 ## 14. Điểm mở rộng khuyến nghị
 
 - Tạo `ota_manager.c/.h`, command firmware update, HTTPS và rollback.
-- Persist `set_price_edit_lock` nếu muốn trạng thái qua reboot.
 - Gửi ACK kết quả cuối cho `set_unit_price`, thay vì chỉ ACK accepted.
 - Persist dedup request nếu backend cần idempotency qua reboot.
 - Lưu timestamp gốc cho buffered transaction.

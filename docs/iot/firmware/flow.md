@@ -6,15 +6,25 @@
 sequenceDiagram
     participant Boot as app_main
     participant WiFi as wifi_manager
+    participant Settings as device_settings
     participant Time as time_manager
     participant MQTT as mqtt_manager
     participant App as Application tasks
 
     Boot->>WiFi: start()
     WiFi->>WiFi: init NVS, load credentials
+    alt Wi-Fi credential chưa có
+        WiFi->>WiFi: seed factory credential + readback
+    end
     WiFi-->>Boot: return ngay
+    Boot->>Settings: init()
+    alt core_cfg chưa có/không hợp lệ
+        Settings->>Settings: seed factory core config + readback
+    else core_cfg hợp lệ
+        Settings->>Settings: load node/MQTT config + command settings
+    end
     Boot->>Time: start SNTP manager
-    Boot->>MQTT: init MQTT client
+    Boot->>MQTT: init client bằng core_cfg từ NVS
     Boot->>App: start heartbeat/sniffer/keypad/command tasks
     WiFi->>WiFi: connect STA
     WiFi-->>Time: IP_EVENT_STA_GOT_IP
@@ -26,6 +36,8 @@ sequenceDiagram
 ```
 
 Không bước nào buộc `app_main()` chờ network. Khi Wi-Fi mất, MQTT ready bị clear; Wi-Fi và MQTT tự reconnect bằng timer/backoff.
+
+OTA app chỉ thay nội dung `ota_0`/`ota_1`. Partition `nvs` riêng được giữ nguyên, nên boot sau OTA đi theo nhánh load cấu hình đã provision thay vì seed lại.
 
 ## 2. Sniffer LED
 

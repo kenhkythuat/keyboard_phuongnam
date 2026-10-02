@@ -72,6 +72,11 @@ Giao dịch invalid do công thức hiện không được retry và không gử
 | Mapping trùng shortcut ở slot khác | `ESP_ERR_INVALID_ARG`, ACK `invalid_param` |
 | Ghi mapping xong readback sai | ACK `reported_mismatch` hoặc `verification_failed` |
 | Mode calibration chưa lưu | Dùng mặc định `P1E` |
+| `core_cfg` chưa tồn tại | Seed từ `device_config.h`, commit và readback |
+| `core_cfg` sai magic/version/length | Khôi phục factory seed và log cảnh báo |
+| Ghi/readback core config lỗi | Giữ cấu hình RAM cũ, trả lỗi storage/verification |
+| OTA chỉ cập nhật app slot | Giữ nguyên toàn bộ NVS |
+| `erase_flash` hoặc xóa NVS | Mất cấu hình; boot sau seed lại factory defaults |
 
 Cảnh báo: nhánh erase NVS khi init lỗi sẽ xóa Wi-Fi, settings và pending transaction vì chúng cùng nằm trong partition NVS.
 

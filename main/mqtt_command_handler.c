@@ -52,7 +52,6 @@ static const char *TAG = "MQTT_COMMAND";
 static QueueHandle_t s_command_queue;
 static SemaphoreHandle_t s_totalizer_mutex;
 static bool s_started;
-static bool s_price_edit_locked;
 static char s_request_history[DEDUP_HISTORY_LENGTH][REQUEST_ID_MAX_LENGTH + 1U];
 static size_t s_request_history_count;
 static size_t s_request_history_next;
@@ -1369,10 +1368,28 @@ static void process_command(const command_message_t *message)
         }
 
         bool requested_locked = cJSON_IsTrue(locked_item);
-        __atomic_store_n(&s_price_edit_locked, requested_locked,
-                         __ATOMIC_RELEASE);
-        bool actual_locked = __atomic_load_n(&s_price_edit_locked,
-                                             __ATOMIC_ACQUIRE);
+        esp_err_t settings_err =
+            device_settings_set_price_edit_locked(requested_locked);
+        bool actual_locked = device_settings_is_price_edit_locked();
+        if (settings_err != ESP_OK) {
+            const char *description =
+                settings_err == ESP_ERR_INVALID_RESPONSE
+                    ? "verification_failed"
+                    : "storage_error";
+            esp_err_t err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", description, false, 0U, false, false,
+                false, 0U, 0.0);
+            if (err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            } else {
+                ESP_LOGE(TAG, "Publish ACK set_price_edit_lock storage "
+                              "that bai: %s",
+                         esp_err_to_name(err));
+            }
+            cJSON_Delete(root);
+            return;
+        }
         if (actual_locked != requested_locked) {
             esp_err_t err = publish_ack(
                 request_id->valuestring, command->valuestring,

@@ -244,7 +244,7 @@ Node chỉ subscribe topic `command` của chính nó. Chi tiết payload và co
 ## Wi-Fi và Web Portal
 
 - Khi boot, firmware ưu tiên credential trong NVS `wifi_cfg/credentials`.
-- Nếu chưa có, dùng credential factory trong `device_config.h`.
+- Nếu chưa có, credential factory trong `device_config.h` được seed vào NVS và dùng từ đó về sau.
 - Mất kết nối: backoff từ 1 đến 30 giây, không reset MCU.
 - Giữ IO0 hơn 7 giây: chuyển sang `WIFI_MODE_APSTA`, mở AP cấu hình.
 - Endpoint: `GET /`, `POST /save`, `GET /status`.
@@ -266,13 +266,17 @@ Không log password Wi-Fi.
 | Namespace | Key | Nội dung |
 |---|---|---|
 | `wifi_cfg` | `credentials` | SSID/password đã xác nhận |
+| `device_cfg` | `core_cfg` | `node_id`, MQTT host/port, username/password |
 | `device_cfg` | `hash_lock` | Trạng thái khóa phím `#` |
+| `device_cfg` | `price_lock` | Trạng thái khóa sửa giá |
 | `device_cfg` | `cal_mode` | `mode_calibration`, mặc định `P1E` |
 | `device_cfg` | `shortcuts` | 10 shortcut mapping + revision |
 | `device_cfg` | `calib_map` | 5 calibration mapping |
 | `pump_tx` | `queue` | Tối đa 32 giao dịch pending |
 
-`set_price_edit_lock` hiện chỉ giữ trong RAM và mất sau reboot.
+`main/device_config.h` chỉ chứa giá trị seed dùng khi xuất xưởng. Lần boot đầu tiên ghi và readback cấu hình lõi vào NVS. Các lần boot sau, MQTT luôn lấy cấu hình từ NVS; thay đổi macro trong một firmware OTA không ghi đè thiết bị đã provision.
+
+Các API `device_settings_get_core_config()` và `device_settings_set_core_config()` là điểm đọc/ghi duy nhất cho cấu hình lõi. API ghi chỉ cập nhật RAM sau khi commit và readback NVS thành công. Cấu hình MQTT mới có hiệu lực sau reboot để tránh tạo nhiều MQTT client.
 
 ## Partition và OTA
 
@@ -282,7 +286,7 @@ Flash 8 MB đã có hai slot app 3 MB:
 nvs | otadata | phy_init | ota_0 | ota_1 | storage | coredump
 ```
 
-Partition đã sẵn sàng cho OTA, nhưng repository hiện chưa có `ota_manager` hoặc command OTA. Rollback bootloader cũng chưa bật. Khi bổ sung OTA nên dùng HTTPS, kiểm tra hash/chữ ký và bật rollback.
+Partition `nvs` nằm ngoài `ota_0` và `ota_1`, vì vậy OTA chỉ cập nhật app sẽ giữ cấu hình. `erase_flash`, xóa partition NVS hoặc thay partition table làm mất vùng `0x9000..0xEFFF` vẫn có thể xóa cấu hình. Repository hiện chưa có `ota_manager` hoặc command OTA; khi bổ sung nên dùng HTTPS, kiểm tra hash/chữ ký và bật rollback.
 
 ## Build và flash
 

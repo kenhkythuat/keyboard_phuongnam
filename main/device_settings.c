@@ -13,9 +13,13 @@
 
 #define SETTINGS_NAMESPACE       "device_cfg"
 #define HASH_KEY_LOCKED_KEY      "hash_lock"
+#define PRICE_EDIT_LOCKED_KEY    "price_lock"
 #define MODE_CALIBRATION_KEY     "cal_mode"
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
+#define CORE_CONFIG_KEY          "core_cfg"
+#define CORE_CONFIG_MAGIC        0x434F5245UL
+#define CORE_CONFIG_VERSION      1U
 #define SHORTCUT_STORE_MAGIC     0x53434D50UL
 #define SHORTCUT_STORE_VERSION   2U
 #define SHORTCUT_STORE_LEGACY_VERSION 1U
@@ -40,9 +44,18 @@ typedef struct {
     calibration_mapping_t mappings[CALIBRATION_STORAGE_SLOT_COUNT];
 } calibration_store_t;
 
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    device_core_config_t config;
+} core_config_store_t;
+
 static const char *TAG = "DEVICE_SETTINGS";
 static nvs_handle_t s_nvs_handle;
 static bool s_hash_key_locked;
+static bool s_price_edit_locked;
+static device_core_config_t s_core_config;
 static char s_mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 static bool s_initialized;
 static shortcut_store_t s_shortcut_store;
@@ -50,6 +63,112 @@ static calibration_store_t s_calibration_store;
 static portMUX_TYPE s_shortcut_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_mode_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_core_config_lock = portMUX_INITIALIZER_UNLOCKED;
+
+_Static_assert(sizeof(NODE_ID) - 1U <= DEVICE_NODE_ID_MAX_LENGTH,
+               "Factory NODE_ID is too long");
+_Static_assert(sizeof(MQTT_BROKER_HOST) - 1U <=
+                   DEVICE_MQTT_HOST_MAX_LENGTH,
+               "Factory MQTT host is too long");
+_Static_assert(sizeof(MQTT_USERNAME) - 1U <=
+                   DEVICE_MQTT_USERNAME_MAX_LENGTH,
+               "Factory MQTT username is too long");
+_Static_assert(sizeof(MQTT_PASSWORD) - 1U <=
+                   DEVICE_MQTT_PASSWORD_MAX_LENGTH,
+               "Factory MQTT password is too long");
+
+static bool node_id_is_valid(const char *node_id)
+{
+    static const char prefix[] = "node_kbd_";
+    if (node_id == NULL ||
+        strnlen(node_id, DEVICE_NODE_ID_MAX_LENGTH + 1U) !=
+            sizeof(prefix) - 1U + 3U ||
+        strncmp(node_id, prefix, sizeof(prefix) - 1U) != 0) {
+        return false;
+    }
+
+    const char *number = node_id + sizeof(prefix) - 1U;
+    if (number[0] < '0' || number[0] > '9' ||
+        number[1] < '0' || number[1] > '9' ||
+        number[2] < '0' || number[2] > '9') {
+        return false;
+    }
+
+    uint16_t value = (uint16_t)(((number[0] - '0') * 100) +
+                                ((number[1] - '0') * 10) +
+                                (number[2] - '0'));
+    return value >= 1U && value <= 999U;
+}
+
+static bool nonempty_string_is_valid(const char *value, size_t max_length)
+{
+    if (value == NULL) {
+        return false;
+    }
+    size_t length = strnlen(value, max_length + 1U);
+    return length > 0U && length <= max_length;
+}
+
+static bool mqtt_host_is_valid(const char *host)
+{
+    if (!nonempty_string_is_valid(host, DEVICE_MQTT_HOST_MAX_LENGTH)) {
+        return false;
+    }
+    for (size_t index = 0U; host[index] != '\0'; index++) {
+        unsigned char character = (unsigned char)host[index];
+        if (character <= 0x20U || character == 0x7FU) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool device_settings_core_config_is_valid(
+    const device_core_config_t *config)
+{
+    return config != NULL &&
+           node_id_is_valid(config->node_id) &&
+           mqtt_host_is_valid(config->mqtt_broker_host) &&
+           config->mqtt_broker_port > 0U &&
+           nonempty_string_is_valid(config->mqtt_username,
+                                    DEVICE_MQTT_USERNAME_MAX_LENGTH) &&
+           nonempty_string_is_valid(config->mqtt_password,
+                                    DEVICE_MQTT_PASSWORD_MAX_LENGTH);
+}
+
+static void load_factory_core_config(device_core_config_t *config)
+{
+    memset(config, 0, sizeof(*config));
+    strlcpy(config->node_id, NODE_ID, sizeof(config->node_id));
+    strlcpy(config->mqtt_broker_host, MQTT_BROKER_HOST,
+            sizeof(config->mqtt_broker_host));
+    config->mqtt_broker_port = MQTT_BROKER_PORT;
+    strlcpy(config->mqtt_username, MQTT_USERNAME,
+            sizeof(config->mqtt_username));
+    strlcpy(config->mqtt_password, MQTT_PASSWORD,
+            sizeof(config->mqtt_password));
+}
+
+static esp_err_t write_core_config_store(const core_config_store_t *store)
+{
+    esp_err_t err = nvs_set_blob(s_nvs_handle, CORE_CONFIG_KEY,
+                                 store, sizeof(*store));
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    core_config_store_t readback = {0};
+    size_t size = sizeof(readback);
+    err = nvs_get_blob(s_nvs_handle, CORE_CONFIG_KEY, &readback, &size);
+    if (err != ESP_OK || size != sizeof(readback) ||
+        memcmp(&readback, store, sizeof(readback)) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
 
 static void reset_shortcut_store(shortcut_store_t *store)
 {
@@ -226,28 +345,94 @@ esp_err_t device_settings_init(void)
         return err;
     }
 
-    uint8_t stored_value = 0U;
-    err = nvs_get_u8(s_nvs_handle, HASH_KEY_LOCKED_KEY, &stored_value);
+    core_config_store_t stored_core = {0};
+    size_t core_size = sizeof(stored_core);
+    err = nvs_get_blob(s_nvs_handle, CORE_CONFIG_KEY,
+                       &stored_core, &core_size);
+    bool seed_factory_core = err == ESP_ERR_NVS_NOT_FOUND ||
+                             err == ESP_ERR_NVS_INVALID_LENGTH ||
+                             core_size != sizeof(stored_core) ||
+                             stored_core.magic != CORE_CONFIG_MAGIC ||
+                             stored_core.version != CORE_CONFIG_VERSION ||
+                             !device_settings_core_config_is_valid(
+                                 &stored_core.config);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND &&
+        err != ESP_ERR_NVS_INVALID_LENGTH) {
+        nvs_close(s_nvs_handle);
+        return err;
+    }
+    if (seed_factory_core) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "Core config NVS khong hop le, khoi phuc factory seed");
+        }
+        memset(&stored_core, 0, sizeof(stored_core));
+        stored_core.magic = CORE_CONFIG_MAGIC;
+        stored_core.version = CORE_CONFIG_VERSION;
+        load_factory_core_config(&stored_core.config);
+        if (!device_settings_core_config_is_valid(&stored_core.config)) {
+            ESP_LOGE(TAG, "Factory core config khong hop le");
+            nvs_close(s_nvs_handle);
+            return ESP_ERR_INVALID_ARG;
+        }
+        err = write_core_config_store(&stored_core);
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+        ESP_LOGI(TAG, "Da seed core config xuat xuong vao NVS cho node=%s",
+                 stored_core.config.node_id);
+    }
+
+    uint8_t stored_hash_value = 0U;
+    err = nvs_get_u8(s_nvs_handle, HASH_KEY_LOCKED_KEY,
+                     &stored_hash_value);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        stored_value = 0U;
-        err = ESP_OK;
+        stored_hash_value = 0U;
+        err = nvs_set_u8(s_nvs_handle, HASH_KEY_LOCKED_KEY, 0U);
+        if (err == ESP_OK) {
+            err = nvs_commit(s_nvs_handle);
+        }
     } else if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    }
+    if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    }
+
+    uint8_t stored_price_value = 0U;
+    err = nvs_get_u8(s_nvs_handle, PRICE_EDIT_LOCKED_KEY,
+                     &stored_price_value);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        stored_price_value = 0U;
+        err = nvs_set_u8(s_nvs_handle, PRICE_EDIT_LOCKED_KEY, 0U);
+        if (err == ESP_OK) {
+            err = nvs_commit(s_nvs_handle);
+        }
+    } else if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    }
+    if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
     }
 
     char stored_mode[sizeof(s_mode_calibration)] = DEFAULT_MODE_CALIBRATION;
     size_t stored_mode_size = 0U;
+    bool persist_default_mode = false;
     err = nvs_get_str(s_nvs_handle, MODE_CALIBRATION_KEY, NULL,
                       &stored_mode_size);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        err = ESP_OK;
+        persist_default_mode = true;
     } else if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
     } else if (stored_mode_size > sizeof(stored_mode)) {
         ESP_LOGW(TAG, "mode_calibration trong NVS qua dai, dung mac dinh %s",
                  DEFAULT_MODE_CALIBRATION);
+        persist_default_mode = true;
     } else {
         err = nvs_get_str(s_nvs_handle, MODE_CALIBRATION_KEY, stored_mode,
                           &stored_mode_size);
@@ -261,17 +446,31 @@ esp_err_t device_settings_init(void)
                      DEFAULT_MODE_CALIBRATION);
             strlcpy(stored_mode, DEFAULT_MODE_CALIBRATION,
                     sizeof(stored_mode));
+            persist_default_mode = true;
+        }
+    }
+    if (persist_default_mode) {
+        strlcpy(stored_mode, DEFAULT_MODE_CALIBRATION,
+                sizeof(stored_mode));
+        err = nvs_set_str(s_nvs_handle, MODE_CALIBRATION_KEY, stored_mode);
+        if (err == ESP_OK) {
+            err = nvs_commit(s_nvs_handle);
+        }
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
         }
     }
 
     shortcut_store_t stored_shortcuts;
-    bool shortcuts_migrated = false;
+    bool shortcuts_need_write = false;
     size_t blob_size = sizeof(stored_shortcuts);
     err = nvs_get_blob(s_nvs_handle, SHORTCUT_MAPPING_KEY,
                        &stored_shortcuts, &blob_size);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         reset_shortcut_store(&stored_shortcuts);
         err = ESP_OK;
+        shortcuts_need_write = true;
     } else if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
@@ -284,7 +483,7 @@ esp_err_t device_settings_init(void)
                    sizeof(stored_shortcuts.mappings[index]));
         }
         stored_shortcuts.version = SHORTCUT_STORE_VERSION;
-        shortcuts_migrated = true;
+        shortcuts_need_write = true;
         ESP_LOGI(TAG, "Chuyen shortcut NVS cu sang slot 1..%u",
                  (unsigned)stored_shortcuts.count);
     } else if (blob_size != sizeof(stored_shortcuts) ||
@@ -293,16 +492,18 @@ esp_err_t device_settings_init(void)
         ESP_LOGW(TAG, "Shortcut mapping NVS khong hop le, dung bang rong");
         reset_shortcut_store(&stored_shortcuts);
         err = ESP_OK;
+        shortcuts_need_write = true;
     }
 
     calibration_store_t stored_calibrations;
-    bool calibrations_migrated = false;
+    bool calibrations_need_write = false;
     blob_size = sizeof(stored_calibrations);
     err = nvs_get_blob(s_nvs_handle, CALIBRATION_MAPPING_KEY,
                        &stored_calibrations, &blob_size);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         reset_calibration_store(&stored_calibrations);
         err = ESP_OK;
+        calibrations_need_write = true;
     } else if (err != ESP_OK) {
         nvs_close(s_nvs_handle);
         return err;
@@ -322,7 +523,7 @@ esp_err_t device_settings_init(void)
         }
         stored_calibrations.count = retained;
         stored_calibrations.version = CALIBRATION_STORE_VERSION;
-        calibrations_migrated = true;
+        calibrations_need_write = true;
         ESP_LOGI(TAG, "Chuyen calibration NVS cu sang slot 1..%u",
                  (unsigned)retained);
     } else if (blob_size != sizeof(stored_calibrations) ||
@@ -331,18 +532,20 @@ esp_err_t device_settings_init(void)
         ESP_LOGW(TAG, "Calibration mapping NVS khong hop le, dung bang rong");
         reset_calibration_store(&stored_calibrations);
         err = ESP_OK;
+        calibrations_need_write = true;
     }
 
-    if (shortcuts_migrated) {
+    if (shortcuts_need_write) {
         err = nvs_set_blob(s_nvs_handle, SHORTCUT_MAPPING_KEY,
                            &stored_shortcuts, sizeof(stored_shortcuts));
     }
-    if (err == ESP_OK && calibrations_migrated) {
+    if (err == ESP_OK && calibrations_need_write) {
         err = nvs_set_blob(s_nvs_handle, CALIBRATION_MAPPING_KEY,
                            &stored_calibrations,
                            sizeof(stored_calibrations));
     }
-    if (err == ESP_OK && (shortcuts_migrated || calibrations_migrated)) {
+    if (err == ESP_OK &&
+        (shortcuts_need_write || calibrations_need_write)) {
         err = nvs_commit(s_nvs_handle);
     }
     if (err != ESP_OK) {
@@ -358,19 +561,92 @@ esp_err_t device_settings_init(void)
     s_calibration_store = stored_calibrations;
     portEXIT_CRITICAL(&s_calibration_lock);
 
-    __atomic_store_n(&s_hash_key_locked, stored_value != 0U, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&s_core_config_lock);
+    s_core_config = stored_core.config;
+    portEXIT_CRITICAL(&s_core_config_lock);
+
+    __atomic_store_n(&s_hash_key_locked, stored_hash_value != 0U,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&s_price_edit_locked, stored_price_value != 0U,
+                     __ATOMIC_RELEASE);
     portENTER_CRITICAL(&s_mode_calibration_lock);
     strlcpy(s_mode_calibration, stored_mode, sizeof(s_mode_calibration));
     portEXIT_CRITICAL(&s_mode_calibration_lock);
     s_initialized = true;
+    ESP_LOGI(TAG, "Khoi phuc core config node=%s broker=%s:%u tu NVS",
+             stored_core.config.node_id,
+             stored_core.config.mqtt_broker_host,
+             (unsigned)stored_core.config.mqtt_broker_port);
     ESP_LOGI(TAG, "Khoi phuc hash_key_locked=%s tu Flash",
-             stored_value != 0U ? "true" : "false");
+             stored_hash_value != 0U ? "true" : "false");
+    ESP_LOGI(TAG, "Khoi phuc price_edit_locked=%s tu Flash",
+             stored_price_value != 0U ? "true" : "false");
     ESP_LOGI(TAG, "Khoi phuc %u shortcut mapping, revision=%" PRIu32,
              (unsigned)stored_shortcuts.count, stored_shortcuts.revision);
     ESP_LOGI(TAG, "Khoi phuc %u calibration mapping tu Flash",
              (unsigned)stored_calibrations.count);
     ESP_LOGI(TAG, "Khoi phuc mode_calibration=%s tu Flash/mac dinh",
              stored_mode);
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_core_config(device_core_config_t *config)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_core_config_lock);
+    *config = s_core_config;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    return ESP_OK;
+}
+
+esp_err_t device_settings_set_core_config(
+    const device_core_config_t *config)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!device_settings_core_config_is_valid(config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    device_core_config_t previous;
+    portENTER_CRITICAL(&s_core_config_lock);
+    previous = s_core_config;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    if (memcmp(&previous, config, sizeof(previous)) == 0) {
+        return ESP_OK;
+    }
+
+    core_config_store_t updated = {
+        .magic = CORE_CONFIG_MAGIC,
+        .version = CORE_CONFIG_VERSION,
+        .config = *config,
+    };
+    esp_err_t err = write_core_config_store(&updated);
+    if (err != ESP_OK) {
+        core_config_store_t restore = {
+            .magic = CORE_CONFIG_MAGIC,
+            .version = CORE_CONFIG_VERSION,
+            .config = previous,
+        };
+        (void)write_core_config_store(&restore);
+        return err;
+    }
+
+    portENTER_CRITICAL(&s_core_config_lock);
+    s_core_config = updated.config;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    ESP_LOGI(TAG, "Da luu core config node=%s broker=%s:%u vao NVS; "
+                  "reboot de MQTT ap dung",
+             updated.config.node_id,
+             updated.config.mqtt_broker_host,
+             (unsigned)updated.config.mqtt_broker_port);
     return ESP_OK;
 }
 
@@ -397,8 +673,47 @@ esp_err_t device_settings_set_hash_key_locked(bool locked)
         return err;
     }
 
+    uint8_t readback = 0U;
+    err = nvs_get_u8(s_nvs_handle, HASH_KEY_LOCKED_KEY, &readback);
+    if (err != ESP_OK || readback != (locked ? 1U : 0U)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     __atomic_store_n(&s_hash_key_locked, locked, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "Da luu hash_key_locked=%s vao Flash",
+             locked ? "true" : "false");
+    return ESP_OK;
+}
+
+bool device_settings_is_price_edit_locked(void)
+{
+    return s_initialized &&
+           __atomic_load_n(&s_price_edit_locked, __ATOMIC_ACQUIRE);
+}
+
+esp_err_t device_settings_set_price_edit_locked(bool locked)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = nvs_set_u8(s_nvs_handle, PRICE_EDIT_LOCKED_KEY,
+                               locked ? 1U : 0U);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t readback = 0U;
+    err = nvs_get_u8(s_nvs_handle, PRICE_EDIT_LOCKED_KEY, &readback);
+    if (err != ESP_OK || readback != (locked ? 1U : 0U)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    __atomic_store_n(&s_price_edit_locked, locked, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "Da luu price_edit_locked=%s vao Flash",
              locked ? "true" : "false");
     return ESP_OK;
 }
