@@ -50,6 +50,7 @@ File [FIRMWARE_ARCHITECTURE.md](FIRMWARE_ARCHITECTURE.md) là tài liệu cũ v�
 | `main/time_manager.c` | SNTP, system time, `ts` và `time_device` |
 | `main/device_settings.c` | Cấu hình persistent: khóa `#`, shortcut, calibration và mode calibration |
 | `main/telemetry_heartbeat.c` | Heartbeat MQTT mỗi 60 giây |
+| `main/ota_manager.c` | Kiểm tra version, HTTPS OTA, self-test và rollback |
 | `main/device_config.h` | Node ID, MQTT, Wi-Fi mặc định và cấu hình portal |
 
 ## Sơ đồ tổng quát
@@ -286,7 +287,17 @@ Flash 8 MB đã có hai slot app 3 MB:
 nvs | otadata | phy_init | ota_0 | ota_1 | storage | coredump
 ```
 
-Partition `nvs` nằm ngoài `ota_0` và `ota_1`, vì vậy OTA chỉ cập nhật app sẽ giữ cấu hình. `erase_flash`, xóa partition NVS hoặc thay partition table làm mất vùng `0x9000..0xEFFF` vẫn có thể xóa cấu hình. Repository hiện chưa có `ota_manager` hoặc command OTA; khi bổ sung nên dùng HTTPS, kiểm tra hash/chữ ký và bật rollback.
+Partition `nvs` nằm ngoài `ota_0` và `ota_1`, vì vậy OTA chỉ cập nhật app sẽ giữ cấu hình. `erase_flash`, xóa partition NVS hoặc thay partition table làm mất vùng `0x9000..0xEFFF` vẫn có thể xóa cấu hình.
+
+Command `OTA` với `param={}` được ACK ngay bằng `ota_accepted`, sau đó `ota_manager` chạy trong task riêng:
+
+1. Đọc `OTA/version.json` qua HTTPS Raw GitHub.
+2. So sánh version dạng `major.minor.patch` với `PROJECT_VER` hiện tại.
+3. Nếu version mới hơn, tải `OTA/file.bin` vào OTA slot còn lại.
+4. Kiểm tra project/version trong image descriptor rồi đổi boot partition và reboot.
+5. Firmware mới ở trạng thái `PENDING_VERIFY`; sau 10 giây self-test NVS thành công sẽ tự xác nhận. Reset/crash trước khi xác nhận sẽ rollback.
+
+Repository phải public để ESP32 truy cập Raw GitHub. URL SSH `git@github.com:...` chỉ dùng bởi Git trên máy phát triển, không phải URL download của thiết bị.
 
 ## Build và flash
 
@@ -295,8 +306,11 @@ Mở ESP-IDF terminal rồi chạy:
 ```powershell
 idf.py set-target esp32s3
 idf.py build
+python tools/prepare_ota.py
 idf.py -p COMx flash monitor
 ```
+
+Mỗi release phải tăng `PROJECT_VER` trong `CMakeLists.txt`, build lại, chạy `tools/prepare_ota.py`, rồi commit/push đồng thời `OTA/file.bin` và `OTA/version.json` lên nhánh `main`. Không publish manifest mới trước binary tương ứng.
 
 Không commit credential production vào source. Trước khi nhân bản board phải đổi `NODE_ID` thành giá trị duy nhất trong khoảng `node_kbd_001` đến `node_kbd_999`.
 

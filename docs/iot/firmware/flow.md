@@ -243,3 +243,33 @@ flowchart TD
     C -- No --> G[Keep firmware running]
     G --> A
 ```
+
+## 11. OTA
+
+```mermaid
+sequenceDiagram
+    participant Server
+    participant Command as MQTT command task
+    participant OTA as ota_manager task
+    participant GitHub as GitHub Raw HTTPS
+    participant Boot as Bootloader
+
+    Server->>Command: cmd=OTA, param={}
+    Command->>OTA: queue update request
+    Command-->>Server: ACK ok / ota_accepted
+    OTA->>GitHub: GET OTA/version.json
+    OTA->>OTA: compare remote version > current version
+    alt version mới hơn
+        OTA->>GitHub: GET OTA/file.bin
+        OTA->>OTA: verify image project + version
+        OTA->>OTA: write inactive OTA slot
+        OTA->>Boot: reboot into PENDING_VERIFY image
+        Boot->>OTA: start new firmware
+        OTA->>OTA: wait 10 s + verify core NVS
+        OTA->>Boot: mark app valid
+    else bằng hoặc thấp hơn
+        OTA->>OTA: log up-to-date, không ghi flash
+    end
+```
+
+Nếu firmware mới reset/crash trước khi gọi mark-valid, bootloader chọn lại app slot hợp lệ trước đó. NVS không nằm trong app slot nên cấu hình thiết bị không bị thay bằng factory seed sau OTA.

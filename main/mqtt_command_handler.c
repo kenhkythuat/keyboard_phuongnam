@@ -18,6 +18,7 @@
 
 #include "device_settings.h"
 #include "mqtt_manager.h"
+#include "ota_manager.h"
 #include "pump_data_sniffer.h"
 #include "time_manager.h"
 #include "virtual_key_output.h"
@@ -143,6 +144,7 @@ static bool command_name_is_declared(const char *command)
         "set_shortcut_mapping",
         "delete_shortcut_mapping",
         "get_reported_state",
+        "OTA",
     };
 
     for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]); index++) {
@@ -1204,6 +1206,40 @@ static void process_command(const command_message_t *message)
         cJSON_IsString(version) &&
         strcmp(version->valuestring, "1.3") == 0 &&
         cJSON_IsObject(param);
+
+    if (strcmp(command->valuestring, "OTA") == 0) {
+        if (!envelope_valid || cJSON_GetArraySize(param) != 0) {
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        esp_err_t request_err = ota_manager_request_update();
+        const char *result = request_err == ESP_OK ? "ok" : "rejected";
+        const char *description = request_err == ESP_OK
+                                      ? "ota_accepted"
+                                      : "busy";
+        esp_err_t ack_err = publish_ack(
+            request_id->valuestring, command->valuestring,
+            result, description, false, 0U, false, false,
+            false, 0U, 0.0);
+        if (ack_err == ESP_OK) {
+            remember_request(request_id->valuestring);
+            ESP_LOGI(TAG, "OTA command ACK: current_version=%s result=%s",
+                     ota_manager_get_current_version(), result);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK OTA that bai: %s",
+                     esp_err_to_name(ack_err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
 
     if (strcmp(command->valuestring, "set_shortcut_mapping") == 0) {
         const cJSON *physical_key = NULL;

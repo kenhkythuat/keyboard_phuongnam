@@ -20,6 +20,7 @@
 #include "pump_data_sniffer.h"
 #include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
+#include "ota_manager.h"
 #include "telemetry_heartbeat.h"
 #include "time_manager.h"
 #include "virtual_key_output.h"
@@ -1212,6 +1213,12 @@ void app_main(void)
         ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
     }
 
+    esp_err_t ota_result = ota_manager_start();
+    if (ota_result != ESP_OK) {
+        ESP_LOGE(TAG, "OTA manager init failed: %s",
+                 esp_err_to_name(ota_result));
+    }
+
     esp_err_t heartbeat_result = telemetry_heartbeat_start();
     if (heartbeat_result != ESP_OK) {
         ESP_LOGE(TAG, "Telemetry heartbeat init failed: %s",
@@ -1312,6 +1319,12 @@ void app_main(void)
     esp_err_t mqtt_result = mqtt_manager_start();
     if (mqtt_result != ESP_OK) {
         ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
+    }
+
+    esp_err_t ota_result = ota_manager_start();
+    if (ota_result != ESP_OK) {
+        ESP_LOGE(TAG, "OTA manager init failed: %s",
+                 esp_err_to_name(ota_result));
     }
 
     esp_err_t heartbeat_result = telemetry_heartbeat_start();

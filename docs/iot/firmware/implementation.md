@@ -239,6 +239,40 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 
 Calibration shortcut local reuse chính hàm `execute_calibration_command()` và không phát MQTT ACK.
 
+### 6.9 `OTA`
+
+```json
+{
+  "ts": 1789369157,
+  "version": "1.3",
+  "request_id": "cmd-ota-001",
+  "cmd": "OTA",
+  "param": {}
+}
+```
+
+- Command name phân biệt hoa/thường và phải đúng `OTA`.
+- Handler đưa request vào queue rồi ACK `ok/ota_accepted`; không tải firmware trong MQTT callback/task.
+- Nếu đã có OTA chạy hoặc chờ: ACK `rejected/busy`.
+- Payload sai hoặc `param` không rỗng: ACK `error/invalid_param`.
+- Manifest: `OTA/version.json`, bắt buộc có `version` và `firmware_url`.
+- Chỉ tải khi remote semantic version lớn hơn `PROJECT_VER` hiện tại.
+- Image phải có cùng `project_name` và app version phải đúng version manifest.
+- HTTPS xác minh server bằng ESP x509 Certificate Bundle.
+- GitHub repository phải public; triển khai private cần cơ chế credential riêng.
+
+Ví dụ manifest:
+
+```json
+{
+  "version": "1.0.1",
+  "firmware_url": "https://raw.githubusercontent.com/kenhkythuat/keyboard_phuongnam/main/OTA/file.bin",
+  "size": 1161376
+}
+```
+
+Rollback được bật bằng `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. Firmware mới chờ 10 giây, kiểm tra core config NVS rồi gọi `esp_ota_mark_app_valid_cancel_rollback()`. Nếu self-test lỗi, firmware gọi rollback và reboot.
+
 ## 7. Command khai báo nhưng chưa triển khai
 
 Các tên sau xuất hiện trong danh sách command nhưng chưa có handler:
@@ -366,9 +400,20 @@ Quy trình xuất xưởng:
 4. Mọi thay đổi qua API/command phải commit và readback NVS trước khi báo thành công.
 5. Reboot hoặc OTA app load lại NVS; factory seed mới trong binary không ghi đè cấu hình đã provision.
 
-## 14. Điểm mở rộng khuyến nghị
+## 14. Phát hành OTA
 
-- Tạo `ota_manager.c/.h`, command firmware update, HTTPS và rollback.
+1. Tăng `PROJECT_VER` trong root `CMakeLists.txt`.
+2. Chạy `idf.py build`.
+3. Chạy `python tools/prepare_ota.py`.
+4. Kiểm tra version trong `OTA/version.json` trùng app version vừa build.
+5. Commit/push `OTA/file.bin` và `OTA/version.json` lên nhánh `main` cùng một lần.
+6. Gửi command `OTA` và theo dõi log `OTA_MANAGER` qua lần reboot/self-test.
+
+Không dùng `git@github.com:...` trong firmware; ESP32 tải bằng HTTPS Raw GitHub.
+
+## 15. Điểm mở rộng khuyến nghị
+
+- Bổ sung chữ ký firmware/Secure Boot để chống image bị thay thế nếu tài khoản GitHub bị xâm nhập.
 - Gửi ACK kết quả cuối cho `set_unit_price`, thay vì chỉ ACK accepted.
 - Persist dedup request nếu backend cần idempotency qua reboot.
 - Lưu timestamp gốc cho buffered transaction.

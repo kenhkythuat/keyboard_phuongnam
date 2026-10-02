@@ -110,8 +110,8 @@ Hiện trạng cần xử lý trước khi triển khai production:
 - MQTT đang dùng TCP thường, không TLS.
 - MQTT và Wi-Fi factory credential nằm trong header firmware.
 - Secure Boot và Flash Encryption chưa bật.
-- OTA chưa triển khai dù partition đã sẵn sàng.
-- Bootloader rollback chưa bật.
+- OTA dùng HTTPS và certificate bundle; GitHub repository private chưa được hỗ trợ.
+- Bootloader rollback đã bật, nhưng Secure Boot/chữ ký ứng dụng chưa bật.
 - Web Portal chỉ phù hợp mạng cấu hình cục bộ, chưa có CSRF/session authentication.
 
 ## 9. Log chẩn đoán theo module
@@ -127,6 +127,21 @@ Hiện trạng cần xử lý trước khi triển khai production:
 | `TIME_MANAGER` | SNTP request và sync |
 | `TELEMETRY_HEARTBEAT` | Điều kiện heartbeat hoặc lý do bỏ qua |
 | `KEY_OUTPUT` | Keypad, virtual key, shortcut, P88 và IO39 |
+| `OTA_MANAGER` | Manifest, version, download, self-test và rollback |
+
+### OTA errors
+
+| Điều kiện | Xử lý |
+|---|---|
+| OTA command sai envelope/param | ACK `error/invalid_param` |
+| OTA đang chạy/chờ | ACK `rejected/busy` |
+| GitHub private/404/TLS/network lỗi | Dừng OTA, giữ firmware hiện tại, log lỗi |
+| Manifest quá 1024 byte hoặc JSON/version sai | Dừng OTA, không ghi flash |
+| Remote version bằng/thấp hơn current | Không tải, không reboot |
+| Image project/version không khớp manifest | Abort OTA, giữ boot partition hiện tại |
+| Mất nguồn trong lúc tải | Boot app cũ; inactive slot chưa hoàn tất không được chọn |
+| Firmware mới crash trước self-test | Bootloader rollback app cũ |
+| Self-test đọc core NVS lỗi | Mark invalid và rollback |
 
 ## 10. Test regression tối thiểu
 
@@ -140,3 +155,6 @@ Hiện trạng cần xử lý trước khi triển khai production:
 8. Sai password portal: credential cũ không bị mất.
 9. Mỗi command dùng frame LED mới, không xác nhận bằng frame cũ.
 10. P88 thoát bằng bất kỳ phím và IO39 trở về 0.
+11. OTA cùng version: ACK accepted, không tải/không reboot.
+12. OTA version mới: tải, reboot, self-test và mark-valid.
+13. Ngắt nguồn trước mark-valid: bootloader rollback firmware cũ.
