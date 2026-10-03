@@ -237,6 +237,18 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 - Chỉ sau verify thành công mới lưu mapping và `mode_calibration=name`.
 - ACK `calibration_command_applied`, reported gồm `name`, `command_echo`, `mode_calibration`.
 
+Slot 1 là mode calibration tạm thời. Nếu thiết bị đang ở mode thuộc slot 2-5
+rồi nhận và áp dụng thành công `name_1/raw_command_1`, firmware lưu mode cũ
+trong NVS `device_cfg/cal_restore`. Sau khi một giao dịch mang command code của
+mode 1 hoàn tất, timer một lần chờ 30 giây rồi chạy lại calibration của mode cũ
+qua cùng state machine. Khi verify thành công, `mode_calibration` được trả về
+mode cũ và trạng thái tạm được xóa. Shortcut calibration local vào slot 1 dùng
+cùng cơ chế lưu mode cũ và hoàn nguyên này. Command hoặc shortcut local chuyển
+sang mode 2-5 sẽ hủy lịch hoàn nguyên đang chờ. Nếu một lượt hoàn nguyên thất
+bại sau 3 lần verify nội bộ, firmware tiếp tục lên lịch thử lại sau 30 giây và
+lặp cho tới khi về được mode cũ hoặc phát hiện thiết bị đã chuyển sang mode
+khác.
+
 Calibration shortcut local reuse chính hàm `execute_calibration_command()` và không phát MQTT ACK.
 
 ### 6.9 `OTA`

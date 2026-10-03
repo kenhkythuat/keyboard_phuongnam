@@ -15,6 +15,7 @@
 #define HASH_KEY_LOCKED_KEY      "hash_lock"
 #define PRICE_EDIT_LOCKED_KEY    "price_lock"
 #define MODE_CALIBRATION_KEY     "cal_mode"
+#define MODE_RESTORE_KEY         "cal_restore"
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
 #define CORE_CONFIG_KEY          "core_cfg"
@@ -27,6 +28,8 @@
 #define CALIBRATION_STORE_VERSION 2U
 #define CALIBRATION_STORE_LEGACY_VERSION 1U
 #define CALIBRATION_STORAGE_SLOT_COUNT 10U
+#define MODE_RESTORE_MAGIC       0x4D525354UL
+#define MODE_RESTORE_VERSION     1U
 
 typedef struct {
     uint32_t magic;
@@ -50,6 +53,13 @@ typedef struct {
     uint16_t reserved;
     device_core_config_t config;
 } core_config_store_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    calibration_mode_restore_t restore;
+} calibration_mode_restore_store_t;
 
 static const char *TAG = "DEVICE_SETTINGS";
 static nvs_handle_t s_nvs_handle;
@@ -777,6 +787,99 @@ esp_err_t device_settings_set_mode_calibration(const char *mode)
     portEXIT_CRITICAL(&s_mode_calibration_lock);
     ESP_LOGI(TAG, "Da luu mode_calibration=%s vao Flash", readback);
     return ESP_OK;
+}
+
+esp_err_t device_settings_set_calibration_mode_restore(
+    const calibration_mode_restore_t *restore)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (restore == NULL ||
+        !shortcut_string_is_valid(restore->temporary_mode,
+                                  SHORTCUT_KEY_MAX_LENGTH) ||
+        !shortcut_string_is_valid(restore->previous_mode,
+                                  SHORTCUT_KEY_MAX_LENGTH) ||
+        strcmp(restore->temporary_mode, restore->previous_mode) == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    calibration_mode_restore_store_t stored = {
+        .magic = MODE_RESTORE_MAGIC,
+        .version = MODE_RESTORE_VERSION,
+        .restore = *restore,
+    };
+    esp_err_t err = nvs_set_blob(s_nvs_handle, MODE_RESTORE_KEY,
+                                 &stored, sizeof(stored));
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    calibration_mode_restore_store_t readback = {0};
+    size_t size = sizeof(readback);
+    err = nvs_get_blob(s_nvs_handle, MODE_RESTORE_KEY, &readback, &size);
+    if (err != ESP_OK || size != sizeof(readback) ||
+        memcmp(&readback, &stored, sizeof(stored)) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    ESP_LOGI(TAG, "Da luu mode tam=%s, se khoi phuc mode=%s",
+             restore->temporary_mode, restore->previous_mode);
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_calibration_mode_restore(
+    calibration_mode_restore_t *restore)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (restore == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    calibration_mode_restore_store_t stored = {0};
+    size_t size = sizeof(stored);
+    esp_err_t err = nvs_get_blob(s_nvs_handle, MODE_RESTORE_KEY,
+                                 &stored, &size);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (size != sizeof(stored) || stored.magic != MODE_RESTORE_MAGIC ||
+        stored.version != MODE_RESTORE_VERSION ||
+        !shortcut_string_is_valid(stored.restore.temporary_mode,
+                                  SHORTCUT_KEY_MAX_LENGTH) ||
+        !shortcut_string_is_valid(stored.restore.previous_mode,
+                                  SHORTCUT_KEY_MAX_LENGTH) ||
+        strcmp(stored.restore.temporary_mode,
+               stored.restore.previous_mode) == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *restore = stored.restore;
+    return ESP_OK;
+}
+
+esp_err_t device_settings_clear_calibration_mode_restore(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = nvs_erase_key(s_nvs_handle, MODE_RESTORE_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Da xoa trang thai khoi phuc mode tam");
+    }
+    return err;
 }
 
 bool device_settings_shortcut_mapping_is_valid(const char *shortcut_key,

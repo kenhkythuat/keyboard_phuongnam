@@ -34,6 +34,11 @@ typedef struct {
     char raw_command[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
 } calibration_mapping_t;
 
+typedef struct {
+    char temporary_mode[SHORTCUT_KEY_MAX_LENGTH + 1U];
+    char previous_mode[SHORTCUT_KEY_MAX_LENGTH + 1U];
+} calibration_mode_restore_t;
+
 esp_err_t device_settings_init(void);
 bool device_settings_core_config_is_valid(
     const device_core_config_t *config);
@@ -46,6 +51,11 @@ bool device_settings_is_price_edit_locked(void);
 esp_err_t device_settings_set_price_edit_locked(bool locked);
 esp_err_t device_settings_get_mode_calibration(char *mode, size_t size);
 esp_err_t device_settings_set_mode_calibration(const char *mode);
+esp_err_t device_settings_set_calibration_mode_restore(
+    const calibration_mode_restore_t *restore);
+esp_err_t device_settings_get_calibration_mode_restore(
+    calibration_mode_restore_t *restore);
+esp_err_t device_settings_clear_calibration_mode_restore(void);
 bool device_settings_shortcut_mapping_is_valid(const char *shortcut_key,
                                                const char *physical_key);
 esp_err_t device_settings_set_shortcut_mapping_at(

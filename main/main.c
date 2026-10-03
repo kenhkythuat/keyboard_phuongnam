@@ -665,11 +665,8 @@ static void shortcut_output_task(void *argument)
             if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
                 ESP_LOGI(TAG, "Bat dau calibration local: %s",
                          message.sequence);
-                err = execute_calibration_command(message.sequence);
-                if (err == ESP_OK) {
-                    err = device_settings_set_mode_calibration(
-                        message.mode_calibration);
-                }
+                err = mqtt_command_handler_execute_local_calibration(
+                    message.mode_calibration, message.sequence);
             } else {
                 ESP_LOGI(TAG, "Bat dau phat shortcut: %s", message.sequence);
                 err = virtual_key_output_run_sequence(

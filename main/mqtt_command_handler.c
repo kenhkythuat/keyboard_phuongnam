@@ -12,9 +12,11 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "nvs.h"
 
 #include "device_settings.h"
 #include "firmware_version.h"
@@ -31,7 +33,7 @@
 #define REQUEST_ID_MAX_LENGTH       64U
 #define COMMAND_NAME_MAX_LENGTH     48U
 #define DEDUP_HISTORY_LENGTH        16U
-#define VIRTUAL_KEY_INTERVAL_MS     500U
+#define VIRTUAL_KEY_INTERVAL_MS     40U
 #define SET_UNIT_PRICE_MAX          999999U
 #define SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH 24U
 #define SET_UNIT_PRICE_MAX_ATTEMPTS  3U
@@ -43,24 +45,247 @@
 #define TOTALIZER_TELEMETRY_JSON_SIZE 256U
 #define CALIBRATION_ENTRY_SEQUENCE "C#122973E"
 #define CALIBRATION_MAX_ATTEMPTS   3U
-#define CALIBRATION_RAW_COMMAND_DELAY_MS 1000U
+#define CALIBRATION_RAW_COMMAND_DELAY_MS 50U
 #define MQTT_PROTOCOL_VERSION          "1.3"
+#define PRIMARY_CALIBRATION_SLOT       1U
+#define MODE_RESTORE_DELAY_MS          30000U
+
+typedef enum {
+    COMMAND_MESSAGE_MQTT,
+    COMMAND_MESSAGE_MODE_RESTORE,
+} command_message_type_t;
 
 typedef struct {
+    command_message_type_t type;
+    uint32_t generation;
     size_t length;
     char payload[COMMAND_PAYLOAD_MAX_LENGTH + 1U];
 } command_message_t;
 
+typedef struct {
+    bool armed;
+    bool timer_started;
+    uint32_t generation;
+    calibration_mode_restore_t restore;
+} mode_restore_state_t;
+
 static const char *TAG = "MQTT_COMMAND";
 static QueueHandle_t s_command_queue;
 static SemaphoreHandle_t s_totalizer_mutex;
+static TimerHandle_t s_mode_restore_timer;
 static bool s_started;
 static char s_request_history[DEDUP_HISTORY_LENGTH][REQUEST_ID_MAX_LENGTH + 1U];
 static size_t s_request_history_count;
 static size_t s_request_history_next;
+static mode_restore_state_t s_mode_restore;
+static portMUX_TYPE s_mode_restore_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static esp_err_t reset_total_amount(void);
 static esp_err_t reset_total_volume(void);
+
+static bool find_non_primary_calibration_mode(
+    const char *name,
+    calibration_mapping_t *mapping)
+{
+    if (name == NULL || mapping == NULL) {
+        return false;
+    }
+
+    for (uint8_t slot = PRIMARY_CALIBRATION_SLOT + 1U;
+         slot <= CALIBRATION_MAPPING_MAX_COUNT; slot++) {
+        calibration_mapping_t candidate = {0};
+        if (device_settings_get_calibration_mapping_at(slot, &candidate) ==
+                ESP_OK &&
+            strcmp(candidate.name, name) == 0) {
+            *mapping = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_calibration_mapping_slot(const char *name,
+                                          const char *raw_command,
+                                          uint8_t *slot)
+{
+    if (name == NULL || raw_command == NULL || slot == NULL) {
+        return false;
+    }
+
+    for (uint8_t candidate_slot = 1U;
+         candidate_slot <= CALIBRATION_MAPPING_MAX_COUNT; candidate_slot++) {
+        calibration_mapping_t candidate = {0};
+        if (device_settings_get_calibration_mapping_at(candidate_slot,
+                                                       &candidate) == ESP_OK &&
+            strcmp(candidate.name, name) == 0 &&
+            strcmp(candidate.raw_command, raw_command) == 0) {
+            *slot = candidate_slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool prepare_mode_restore_candidate(
+    uint8_t slot,
+    calibration_mode_restore_t *restore_candidate)
+{
+    if (slot != PRIMARY_CALIBRATION_SLOT || restore_candidate == NULL) {
+        return false;
+    }
+
+    memset(restore_candidate, 0, sizeof(*restore_candidate));
+    char current_mode[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+    calibration_mapping_t previous_mapping = {0};
+    if (device_settings_get_mode_calibration(current_mode,
+                                              sizeof(current_mode)) == ESP_OK &&
+        find_non_primary_calibration_mode(current_mode, &previous_mapping)) {
+        strlcpy(restore_candidate->previous_mode, previous_mapping.name,
+                sizeof(restore_candidate->previous_mode));
+        return true;
+    }
+
+    calibration_mode_restore_t existing_restore = {0};
+    if (device_settings_get_calibration_mode_restore(&existing_restore) ==
+            ESP_OK &&
+        find_non_primary_calibration_mode(existing_restore.previous_mode,
+                                           &previous_mapping)) {
+        strlcpy(restore_candidate->previous_mode,
+                existing_restore.previous_mode,
+                sizeof(restore_candidate->previous_mode));
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Mode 1 khong co mode 2-5 truoc do de khoi phuc");
+    return false;
+}
+
+static void mode_restore_set_ram(
+    const calibration_mode_restore_t *restore)
+{
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    uint32_t generation = s_mode_restore.generation + 1U;
+    if (generation == 0U) {
+        generation = 1U;
+    }
+    memset(&s_mode_restore, 0, sizeof(s_mode_restore));
+    s_mode_restore.armed = true;
+    s_mode_restore.generation = generation;
+    s_mode_restore.restore = *restore;
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+}
+
+static esp_err_t mode_restore_arm(
+    const calibration_mode_restore_t *restore)
+{
+    esp_err_t err = device_settings_set_calibration_mode_restore(restore);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (s_mode_restore_timer != NULL) {
+        (void)xTimerStop(s_mode_restore_timer, 0);
+    }
+    mode_restore_set_ram(restore);
+    ESP_LOGI(TAG, "Mode 1 tam thoi=%s; se ve %s sau giao dich + %u ms",
+             restore->temporary_mode, restore->previous_mode,
+             (unsigned)MODE_RESTORE_DELAY_MS);
+    return ESP_OK;
+}
+
+static esp_err_t mode_restore_cancel(void)
+{
+    if (s_mode_restore_timer != NULL) {
+        (void)xTimerStop(s_mode_restore_timer, 0);
+    }
+    esp_err_t err = device_settings_clear_calibration_mode_restore();
+
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    uint32_t generation = s_mode_restore.generation + 1U;
+    if (generation == 0U) {
+        generation = 1U;
+    }
+    memset(&s_mode_restore, 0, sizeof(s_mode_restore));
+    s_mode_restore.generation = generation;
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+    return err;
+}
+
+static void mode_restore_schedule_retry(uint32_t generation,
+                                        const char *previous_mode,
+                                        esp_err_t reason)
+{
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    bool valid = s_mode_restore.armed &&
+                 s_mode_restore.timer_started &&
+                 s_mode_restore.generation == generation;
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+    if (!valid) {
+        return;
+    }
+
+    if (xTimerChangePeriod(s_mode_restore_timer,
+                           pdMS_TO_TICKS(MODE_RESTORE_DELAY_MS), 0) != pdPASS) {
+        ESP_LOGE(TAG, "Khong hen duoc lan thu lai khoi phuc mode %s",
+                 previous_mode);
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "Khoi phuc mode %s that bai: %s; se thu lai sau %u ms",
+             previous_mode, esp_err_to_name(reason),
+             (unsigned)MODE_RESTORE_DELAY_MS);
+}
+
+static void mode_restore_timer_callback(TimerHandle_t timer)
+{
+    (void)timer;
+    command_message_t message = {
+        .type = COMMAND_MESSAGE_MODE_RESTORE,
+    };
+
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    bool should_queue = s_mode_restore.armed &&
+                        s_mode_restore.timer_started;
+    message.generation = s_mode_restore.generation;
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+
+    if (should_queue &&
+        xQueueSend(s_command_queue, &message, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Command queue day, thu lai khoi phuc mode sau 1 giay");
+        (void)xTimerChangePeriod(s_mode_restore_timer,
+                                pdMS_TO_TICKS(1000U), 0);
+    }
+}
+
+static esp_err_t mode_restore_load(void)
+{
+    calibration_mode_restore_t restore = {0};
+    esp_err_t err = device_settings_get_calibration_mode_restore(&restore);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Trang thai khoi phuc mode NVS khong hop le: %s",
+                 esp_err_to_name(err));
+        return device_settings_clear_calibration_mode_restore();
+    }
+
+    char current_mode[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+    calibration_mapping_t previous_mapping = {0};
+    if (device_settings_get_mode_calibration(current_mode,
+                                              sizeof(current_mode)) != ESP_OK ||
+        strcmp(current_mode, restore.temporary_mode) != 0 ||
+        !find_non_primary_calibration_mode(restore.previous_mode,
+                                           &previous_mapping)) {
+        ESP_LOGW(TAG, "Bo trang thai khoi phuc mode cu khong con phu hop");
+        return device_settings_clear_calibration_mode_restore();
+    }
+
+    mode_restore_set_ram(&restore);
+    ESP_LOGI(TAG, "Khoi phuc lich mode 1 tu NVS: %s -> %s",
+             restore.temporary_mode, restore.previous_mode);
+    return ESP_OK;
+}
 
 static bool string_field_is_valid(const cJSON *item, size_t max_length)
 {
@@ -573,6 +798,102 @@ esp_err_t execute_calibration_command(const char *raw_command)
     esp_err_t err = execute_calibration_locked(raw_command);
     xSemaphoreGive(s_totalizer_mutex);
     return err;
+}
+
+esp_err_t mqtt_command_handler_execute_local_calibration(
+    const char *mode_calibration,
+    const char *raw_command)
+{
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!device_settings_calibration_mapping_is_valid(mode_calibration,
+                                                       raw_command)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t slot = 0U;
+    if (!find_calibration_mapping_slot(mode_calibration, raw_command, &slot)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    calibration_mode_restore_t restore_candidate = {0};
+    bool has_restore_candidate = prepare_mode_restore_candidate(
+        slot, &restore_candidate);
+
+    esp_err_t err = execute_calibration_command(raw_command);
+    if (err == ESP_OK) {
+        err = device_settings_set_mode_calibration(mode_calibration);
+    }
+    if (err == ESP_OK && slot == PRIMARY_CALIBRATION_SLOT &&
+        has_restore_candidate) {
+        strlcpy(restore_candidate.temporary_mode, mode_calibration,
+                sizeof(restore_candidate.temporary_mode));
+        err = mode_restore_arm(&restore_candidate);
+    } else if (err == ESP_OK && slot != PRIMARY_CALIBRATION_SLOT) {
+        err = mode_restore_cancel();
+    }
+
+    return err;
+}
+
+static void process_mode_restore(uint32_t generation)
+{
+    calibration_mode_restore_t restore = {0};
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    bool valid = s_mode_restore.armed &&
+                 s_mode_restore.timer_started &&
+                 s_mode_restore.generation == generation;
+    if (valid) {
+        restore = s_mode_restore.restore;
+    }
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+    if (!valid) {
+        ESP_LOGI(TAG, "Bo qua yeu cau khoi phuc mode da het han");
+        return;
+    }
+
+    char current_mode[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+    esp_err_t err = device_settings_get_mode_calibration(
+        current_mode, sizeof(current_mode));
+    if (err != ESP_OK) {
+        mode_restore_schedule_retry(generation, restore.previous_mode, err);
+        return;
+    }
+    if (strcmp(current_mode, restore.temporary_mode) != 0) {
+        ESP_LOGI(TAG,
+                 "Mode hien tai da chuyen tu %s sang %s, huy lich khoi phuc",
+                 restore.temporary_mode, current_mode);
+        (void)mode_restore_cancel();
+        return;
+    }
+
+    calibration_mapping_t previous_mapping = {0};
+    if (!find_non_primary_calibration_mode(restore.previous_mode,
+                                           &previous_mapping)) {
+        mode_restore_schedule_retry(generation, restore.previous_mode,
+                                    ESP_ERR_NOT_FOUND);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Bat dau khoi phuc mode %s voi raw_command=%s",
+             previous_mapping.name, previous_mapping.raw_command);
+    err = execute_calibration_command(previous_mapping.raw_command);
+    if (err == ESP_OK) {
+        err = device_settings_set_mode_calibration(previous_mapping.name);
+    }
+    if (err != ESP_OK) {
+        mode_restore_schedule_retry(generation, previous_mapping.name, err);
+        return;
+    }
+
+    err = mode_restore_cancel();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Da khoi phuc mode nhung khong xoa duoc NVS tam: %s",
+                 esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "Da tu dong khoi phuc mode_calibration=%s",
+             previous_mapping.name);
 }
 
 static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
@@ -1702,6 +2023,10 @@ static void process_command(const command_message_t *message)
             return;
         }
 
+        calibration_mode_restore_t restore_candidate = {0};
+        bool has_restore_candidate = prepare_mode_restore_candidate(
+            slot, &restore_candidate);
+
         esp_err_t err = execute_calibration_command(raw_command->valuestring);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Calibration MQTT that bai sau %u lan: %s",
@@ -1741,6 +2066,14 @@ static void process_command(const command_message_t *message)
                 strcmp(mode_readback, name->valuestring) != 0) {
                 err = ESP_ERR_INVALID_RESPONSE;
             }
+        }
+        if (err == ESP_OK && slot == PRIMARY_CALIBRATION_SLOT &&
+            has_restore_candidate) {
+            strlcpy(restore_candidate.temporary_mode, name->valuestring,
+                    sizeof(restore_candidate.temporary_mode));
+            err = mode_restore_arm(&restore_candidate);
+        } else if (err == ESP_OK && slot != PRIMARY_CALIBRATION_SLOT) {
+            err = mode_restore_cancel();
         }
         if (err != ESP_OK) {
             const char *description;
@@ -1799,6 +2132,39 @@ static void process_command(const command_message_t *message)
     cJSON_Delete(root);
 }
 
+void mqtt_command_handler_notify_transaction_complete(
+    const char *command_code)
+{
+    if (!s_started || command_code == NULL || s_mode_restore_timer == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_mode_restore_lock);
+    bool should_start = s_mode_restore.armed &&
+                        !s_mode_restore.timer_started &&
+                        strcmp(command_code,
+                               s_mode_restore.restore.temporary_mode) == 0;
+    if (should_start) {
+        s_mode_restore.timer_started = true;
+    }
+    portEXIT_CRITICAL(&s_mode_restore_lock);
+    if (!should_start) {
+        return;
+    }
+
+    if (xTimerChangePeriod(s_mode_restore_timer,
+                           pdMS_TO_TICKS(MODE_RESTORE_DELAY_MS), 0) != pdPASS) {
+        portENTER_CRITICAL(&s_mode_restore_lock);
+        s_mode_restore.timer_started = false;
+        portEXIT_CRITICAL(&s_mode_restore_lock);
+        ESP_LOGE(TAG, "Khong khoi dong duoc timer khoi phuc mode");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Giao dich mode %s hoan tat, se ve mode truoc sau %u ms",
+             command_code, (unsigned)MODE_RESTORE_DELAY_MS);
+}
+
 static void command_callback(const char *payload, size_t length)
 {
     if (payload == NULL || length == 0U ||
@@ -1807,7 +2173,10 @@ static void command_callback(const char *payload, size_t length)
         return;
     }
 
-    command_message_t message = {.length = length};
+    command_message_t message = {
+        .type = COMMAND_MESSAGE_MQTT,
+        .length = length,
+    };
     memcpy(message.payload, payload, length);
     message.payload[length] = '\0';
     if (xQueueSend(s_command_queue, &message, 0) != pdTRUE) {
@@ -1821,6 +2190,10 @@ static void command_task(void *argument)
     command_message_t message;
     while (1) {
         if (xQueueReceive(s_command_queue, &message, portMAX_DELAY) == pdTRUE) {
+            if (message.type == COMMAND_MESSAGE_MODE_RESTORE) {
+                process_mode_restore(message.generation);
+                continue;
+            }
             while (!time_manager_is_valid() || !mqtt_manager_is_ready()) {
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
@@ -1847,8 +2220,34 @@ esp_err_t mqtt_command_handler_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_mode_restore_timer = xTimerCreate(
+        "mode_restore", pdMS_TO_TICKS(MODE_RESTORE_DELAY_MS), pdFALSE,
+        NULL, mode_restore_timer_callback);
+    if (s_mode_restore_timer == NULL) {
+        vQueueDelete(s_command_queue);
+        s_command_queue = NULL;
+        vSemaphoreDelete(s_totalizer_mutex);
+        s_totalizer_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t restore_err = mode_restore_load();
+    if (restore_err != ESP_OK) {
+        ESP_LOGE(TAG, "Khoi tao trang thai khoi phuc mode that bai: %s",
+                 esp_err_to_name(restore_err));
+        xTimerDelete(s_mode_restore_timer, 0);
+        s_mode_restore_timer = NULL;
+        vQueueDelete(s_command_queue);
+        s_command_queue = NULL;
+        vSemaphoreDelete(s_totalizer_mutex);
+        s_totalizer_mutex = NULL;
+        return restore_err;
+    }
+
     if (xTaskCreate(command_task, "mqtt_command", COMMAND_TASK_STACK_SIZE,
                     NULL, COMMAND_TASK_PRIORITY, NULL) != pdPASS) {
+        xTimerDelete(s_mode_restore_timer, 0);
+        s_mode_restore_timer = NULL;
         vQueueDelete(s_command_queue);
         s_command_queue = NULL;
         vSemaphoreDelete(s_totalizer_mutex);

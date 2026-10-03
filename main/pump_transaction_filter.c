@@ -15,6 +15,7 @@
 #include "device_config.h"
 #include "device_settings.h"
 #include "firmware_version.h"
+#include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
 #include "pump_transaction_store.h"
 #include "time_manager.h"
@@ -38,6 +39,7 @@ typedef pump_stored_transaction_t pump_transaction_t;
 typedef enum {
     TRANSACTION_REPORT_DONE,
     TRANSACTION_REPORT_RETRY,
+    TRANSACTION_REPORT_INVALID,
 } transaction_report_result_t;
 
 static const char *TAG = "PUMP_FILTER";
@@ -251,7 +253,7 @@ static transaction_report_result_t report_completed_transaction(
         transaction->amount_vnd == 0U ||
         transaction->volume_ml == 0U) {
         ESP_LOGE(TAG, "Du lieu giao dich khong hop le hoac bang 0");
-        return TRANSACTION_REPORT_DONE;
+        return TRANSACTION_REPORT_INVALID;
     }
 
     float expected_amount_vnd =
@@ -276,12 +278,12 @@ static transaction_report_result_t report_completed_transaction(
             (double)difference_vnd,
             (double)AMOUNT_TOLERANCE_VND
         );
-        return TRANSACTION_REPORT_DONE;
+        return TRANSACTION_REPORT_INVALID;
     }
 
     if (!command_code_is_valid(transaction->command_code)) {
         ESP_LOGE(TAG, "command_code khong hop le");
-        return TRANSACTION_REPORT_DONE;
+        return TRANSACTION_REPORT_INVALID;
     }
 
     time_manager_snapshot_t time_snapshot;
@@ -385,8 +387,9 @@ static void pump_transaction_filter_task(void *argument)
                 break;
             }
 
-            if (report_completed_transaction(&buffered_transaction, true) !=
-                TRANSACTION_REPORT_DONE) {
+            transaction_report_result_t buffered_result =
+                report_completed_transaction(&buffered_transaction, true);
+            if (buffered_result == TRANSACTION_REPORT_RETRY) {
                 break;
             }
 
@@ -397,7 +400,10 @@ static void pump_transaction_filter_task(void *argument)
                 break;
             }
 
-            ESP_LOGI(TAG, "Da gui giao dich Flash, con lai=%u",
+            ESP_LOGI(TAG, "%s giao dich Flash, con lai=%u",
+                     buffered_result == TRANSACTION_REPORT_DONE
+                         ? "Da gui"
+                         : "Da loai bo khong hop le",
                      (unsigned)pump_transaction_store_count());
         }
 
@@ -610,6 +616,10 @@ static void pump_transaction_filter_task(void *argument)
                 ESP_LOGE(TAG, "Khong luu duoc giao dich vao Flash: %s",
                          esp_err_to_name(store_result));
             }
+        }
+        if (report_result != TRANSACTION_REPORT_INVALID) {
+            mqtt_command_handler_notify_transaction_complete(
+                latest_transaction.command_code);
         }
 
         idle_positive_transaction = latest_transaction;

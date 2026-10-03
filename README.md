@@ -271,6 +271,7 @@ Không log password Wi-Fi.
 | `device_cfg` | `hash_lock` | Trạng thái khóa phím `#` |
 | `device_cfg` | `price_lock` | Trạng thái khóa sửa giá |
 | `device_cfg` | `cal_mode` | `mode_calibration`, mặc định `P1E` |
+| `device_cfg` | `cal_restore` | Mode trước khi chuyển tạm sang calibration slot 1 |
 | `device_cfg` | `shortcuts` | 10 shortcut mapping + revision |
 | `device_cfg` | `calib_map` | 5 calibration mapping |
 | `pump_tx` | `queue` | Tối đa 32 giao dịch pending |
