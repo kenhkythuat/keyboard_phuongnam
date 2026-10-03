@@ -57,6 +57,12 @@
 #define DISPLAY_COLUMNS            6U
 
 #define RX_SLOT_COUNT              16U
+#define DECODE_QUEUE_LENGTH        32U
+#define DISPLAY_LOG_QUEUE_LENGTH   8U
+
+#define CAPTURE_TASK_PRIORITY      20U
+#define DECODE_TASK_PRIORITY       19U
+#define DISPLAY_LOG_TASK_PRIORITY  6U
 
 /*
  * Một dữ liệu cột phải xuất hiện lặp lại nhiều lần
@@ -128,6 +134,9 @@ typedef struct {
 } mbi_capture_sample_t;
 
 static QueueHandle_t s_decode_queue;
+static QueueHandle_t s_display_log_queue;
+static volatile uint32_t s_decode_queue_drop_count;
+static volatile uint32_t s_display_log_drop_count;
 
 /* =========================================================
  * Kết quả phân tích tốt nhất trong một mẫu 192 bit
@@ -1222,41 +1231,13 @@ static void process_capture_sample(
     portEXIT_CRITICAL(&s_shared_lock);
 
     if (print_completed_display) {
-        print_display_columns(&display_to_print);
-
-        char row1_string[64];
-        char row2_string[64];
-        char row3_string[64];
-
-        format_display_row(
-            display_to_print.display,
-            0,
-            row1_string,
-            sizeof(row1_string)
-        );
-
-        format_display_row(
-            display_to_print.display,
-            1,
-            row2_string,
-            sizeof(row2_string)
-        );
-
-        format_display_row(
-            display_to_print.display,
-            2,
-            row3_string,
-            sizeof(row3_string)
-        );
-
-        ESP_LOGI(TAG, "========================================");
-        ESP_LOGI(TAG, "LED 01-06: %s", row1_string);
-        ESP_LOGI(TAG, "LED 07-12: %s", row2_string);
-        ESP_LOGI(TAG, "LED 13-18: %s", row3_string);
-        ESP_LOGI(TAG, "========================================");
-
         if (!pump_transaction_filter_submit(display_to_print.display)) {
             ESP_LOGW(TAG, "Khong the gui display sang bo loc du lieu bom");
+        }
+
+        if (xQueueSend(s_display_log_queue, &display_to_print, 0) != pdTRUE) {
+            __atomic_fetch_add(&s_display_log_drop_count, 1U,
+                               __ATOMIC_RELAXED);
         }
     }
 
@@ -1475,14 +1456,17 @@ static void mbi_capture_task(void *argument)
             __ATOMIC_RELAXED
         );
 
-        /*
-         * Queue dài một phần tử:
-         * luôn giữ mẫu mới nhất.
-         */
-        xQueueOverwrite(
-            s_decode_queue,
-            &sample
-        );
+        if (xQueueSend(s_decode_queue, &sample, 0) != pdTRUE) {
+            mbi_capture_sample_t discarded;
+            if (xQueueReceive(s_decode_queue, &discarded, 0) == pdTRUE) {
+                __atomic_fetch_add(&s_decode_queue_drop_count, 1U,
+                                   __ATOMIC_RELAXED);
+            }
+            if (xQueueSend(s_decode_queue, &sample, 0) != pdTRUE) {
+                __atomic_fetch_add(&s_decode_queue_drop_count, 1U,
+                                   __ATOMIC_RELAXED);
+            }
+        }
 
         yield_counter++;
 
@@ -1521,6 +1505,37 @@ static void mbi_decode_task(void *argument)
              */
             taskYIELD();
         }
+    }
+}
+
+static void mbi_display_log_task(void *argument)
+{
+    (void)argument;
+
+    mbi_decode_result_t display;
+    while (1) {
+        if (xQueueReceive(s_display_log_queue, &display,
+                          portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        print_display_columns(&display);
+
+        char row1_string[64];
+        char row2_string[64];
+        char row3_string[64];
+        format_display_row(display.display, 0, row1_string,
+                           sizeof(row1_string));
+        format_display_row(display.display, 1, row2_string,
+                           sizeof(row2_string));
+        format_display_row(display.display, 2, row3_string,
+                           sizeof(row3_string));
+
+        ESP_LOGI(TAG, "========================================");
+        ESP_LOGI(TAG, "LED 01-06: %s", row1_string);
+        ESP_LOGI(TAG, "LED 07-12: %s", row2_string);
+        ESP_LOGI(TAG, "LED 13-18: %s", row3_string);
+        ESP_LOGI(TAG, "========================================");
     }
 }
 
@@ -1714,6 +1729,10 @@ static void mbi_report_task(void *argument)
                 &s_spi_rx_count,
                 __ATOMIC_RELAXED
             );
+        uint32_t decode_queue_drops =
+            __atomic_load_n(&s_decode_queue_drop_count, __ATOMIC_RELAXED);
+        uint32_t display_log_drops =
+            __atomic_load_n(&s_display_log_drop_count, __ATOMIC_RELAXED);
 
         uint32_t decoded_samples;
         uint32_t capture_192;
@@ -1780,6 +1799,8 @@ static void mbi_report_task(void *argument)
             " valid_blocks=%" PRIu32
             " display_ok=%" PRIu32
             " timeout=%" PRIu32
+            " decode_drop=%" PRIu32
+            " log_drop=%" PRIu32
             " latest_bits=%" PRIu32
             " OE=%u"
             " assembling=0x%02X",
@@ -1791,6 +1812,8 @@ static void mbi_report_task(void *argument)
             valid_blocks,
             completed_displays,
             assembly_timeouts,
+            decode_queue_drops,
+            display_log_drops,
             latest_bits,
             latest_oe,
             assembly_mask
@@ -1902,6 +1925,8 @@ static void mbi_report_task(void *argument)
 void pump_data_sniffer_start(void)
 {
     reset_display_assembly();
+    __atomic_store_n(&s_decode_queue_drop_count, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_display_log_drop_count, 0U, __ATOMIC_RELAXED);
     control_display_led_init();
 
     esp_err_t filter_result = pump_transaction_filter_start();
@@ -1914,7 +1939,7 @@ void pump_data_sniffer_start(void)
     }
 
     s_decode_queue = xQueueCreate(
-        1,
+        DECODE_QUEUE_LENGTH,
         sizeof(mbi_capture_sample_t)
     );
 
@@ -1923,26 +1948,38 @@ void pump_data_sniffer_start(void)
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
 
+    s_display_log_queue = xQueueCreate(
+        DISPLAY_LOG_QUEUE_LENGTH,
+        sizeof(mbi_decode_result_t)
+    );
+
+    if (s_display_log_queue == NULL) {
+        ESP_LOGE(TAG, "Khong tao duoc display log queue");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+
+#if CONFIG_FREERTOS_UNICORE
+    const BaseType_t capture_core = 0;
+    const BaseType_t worker_core = 0;
+#else
+    const BaseType_t capture_core = 0;
+    const BaseType_t worker_core = 1;
+#endif
+
     BaseType_t capture_result =
         xTaskCreatePinnedToCore(
             mbi_capture_task,
             "mbi_capture_task",
             4096,
             NULL,
-            8,
+            CAPTURE_TASK_PRIORITY,
             NULL,
-            0
+            capture_core
         );
 
     if (capture_result != pdPASS) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
-
-#if CONFIG_FREERTOS_UNICORE
-    const BaseType_t worker_core = 0;
-#else
-    const BaseType_t worker_core = 1;
-#endif
 
     BaseType_t decode_result =
         xTaskCreatePinnedToCore(
@@ -1950,7 +1987,7 @@ void pump_data_sniffer_start(void)
             "mbi_decode_task",
             6144,
             NULL,
-            5,
+            DECODE_TASK_PRIORITY,
             NULL,
             worker_core
         );
@@ -1958,6 +1995,29 @@ void pump_data_sniffer_start(void)
     if (decode_result != pdPASS) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
+
+    BaseType_t log_result = xTaskCreatePinnedToCore(
+        mbi_display_log_task,
+        "mbi_display_log",
+        4096,
+        NULL,
+        DISPLAY_LOG_TASK_PRIORITY,
+        NULL,
+        0
+    );
+
+    if (log_result != pdPASS) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+
+    ESP_LOGI(TAG,
+             "Sniffer uu tien cao: capture prio=%u, decode prio=%u, "
+             "decode_queue=%u, capture_core=%d, decode_core=%d",
+             (unsigned)CAPTURE_TASK_PRIORITY,
+             (unsigned)DECODE_TASK_PRIORITY,
+             (unsigned)DECODE_QUEUE_LENGTH,
+             (int)capture_core,
+             (int)worker_core);
 
 #if ENABLE_PERIODIC_REPORT_LOG
     BaseType_t report_result = xTaskCreatePinnedToCore(
@@ -1967,7 +2027,7 @@ void pump_data_sniffer_start(void)
         NULL,
         2,
         NULL,
-        worker_core
+        0
     );
 
     if (report_result != pdPASS) {

@@ -122,6 +122,13 @@ Mapping hiện tại:
 
 Bus được capture bằng `SPI2_HOST`, SPI slave mode 1. Một giao dịch chuẩn có 192 bit, tương ứng 6 block x 32 bit.
 
+Đường capture được ưu tiên riêng: task nhận SPI priority 20 chạy trên core 0,
+task decode priority 19 chạy trên core 1 và queue trung gian giữ 32 mẫu. Việc
+in log `COL/LED` chạy ở task priority thấp riêng nên UART chậm không chặn nhận
+và giải mã. Khi bật `ENABLE_PERIODIC_REPORT_LOG`, trường `decode_drop` cho biết
+số mẫu phải bỏ vì decoder không theo kịp; `log_drop` chỉ là số bản log bị bỏ và
+không làm mất snapshot gửi sang transaction filter.
+
 ### MBI5026 LED output
 
 | Chức năng | GPIO |
