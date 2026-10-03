@@ -19,8 +19,11 @@
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
 #define CORE_CONFIG_KEY          "core_cfg"
+#define MQTT_CONFIG_TRIAL_KEY    "mqtt_trial"
 #define CORE_CONFIG_MAGIC        0x434F5245UL
 #define CORE_CONFIG_VERSION      1U
+#define MQTT_CONFIG_TRIAL_MAGIC  0x4D515454UL
+#define MQTT_CONFIG_TRIAL_VERSION 1U
 #define SHORTCUT_STORE_MAGIC     0x53434D50UL
 #define SHORTCUT_STORE_VERSION   2U
 #define SHORTCUT_STORE_LEGACY_VERSION 1U
@@ -54,6 +57,19 @@ typedef struct {
     device_core_config_t config;
 } core_config_store_t;
 
+typedef enum {
+    MQTT_CONFIG_TRIAL_TESTING = 1,
+    MQTT_CONFIG_TRIAL_ROLLING_BACK = 2,
+} mqtt_config_trial_state_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t state;
+    device_core_config_t previous;
+    device_core_config_t candidate;
+} mqtt_config_trial_store_t;
+
 typedef struct {
     uint32_t magic;
     uint16_t version;
@@ -66,6 +82,8 @@ static nvs_handle_t s_nvs_handle;
 static bool s_hash_key_locked;
 static bool s_price_edit_locked;
 static device_core_config_t s_core_config;
+static mqtt_config_trial_store_t s_mqtt_config_trial;
+static bool s_mqtt_config_trial_pending;
 static char s_mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 static bool s_initialized;
 static shortcut_store_t s_shortcut_store;
@@ -178,6 +196,59 @@ static esp_err_t write_core_config_store(const core_config_store_t *store)
         return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
+}
+
+static bool mqtt_config_trial_store_is_valid(
+    const mqtt_config_trial_store_t *store)
+{
+    return store != NULL && store->magic == MQTT_CONFIG_TRIAL_MAGIC &&
+           store->version == MQTT_CONFIG_TRIAL_VERSION &&
+           (store->state == MQTT_CONFIG_TRIAL_TESTING ||
+            store->state == MQTT_CONFIG_TRIAL_ROLLING_BACK) &&
+           device_settings_core_config_is_valid(&store->previous) &&
+           device_settings_core_config_is_valid(&store->candidate) &&
+           strcmp(store->previous.node_id, store->candidate.node_id) == 0;
+}
+
+static esp_err_t write_mqtt_config_trial_store(
+    const mqtt_config_trial_store_t *store)
+{
+    esp_err_t err = nvs_set_blob(s_nvs_handle, MQTT_CONFIG_TRIAL_KEY,
+                                 store, sizeof(*store));
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    mqtt_config_trial_store_t readback = {0};
+    size_t size = sizeof(readback);
+    err = nvs_get_blob(s_nvs_handle, MQTT_CONFIG_TRIAL_KEY,
+                       &readback, &size);
+    if (err != ESP_OK || size != sizeof(readback) ||
+        memcmp(&readback, store, sizeof(readback)) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t erase_mqtt_config_trial_store(void)
+{
+    esp_err_t err = nvs_erase_key(s_nvs_handle, MQTT_CONFIG_TRIAL_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t size = 0U;
+    err = nvs_get_blob(s_nvs_handle, MQTT_CONFIG_TRIAL_KEY, NULL, &size);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 static void reset_shortcut_store(shortcut_store_t *store)
@@ -393,6 +464,60 @@ esp_err_t device_settings_init(void)
                  stored_core.config.node_id);
     }
 
+    mqtt_config_trial_store_t stored_trial = {0};
+    bool mqtt_trial_pending = false;
+    size_t trial_size = sizeof(stored_trial);
+    err = nvs_get_blob(s_nvs_handle, MQTT_CONFIG_TRIAL_KEY,
+                       &stored_trial, &trial_size);
+    if (err == ESP_OK && trial_size == sizeof(stored_trial) &&
+        mqtt_config_trial_store_is_valid(&stored_trial)) {
+        bool active_is_previous =
+            memcmp(&stored_core.config, &stored_trial.previous,
+                   sizeof(stored_core.config)) == 0;
+        bool active_is_candidate =
+            memcmp(&stored_core.config, &stored_trial.candidate,
+                   sizeof(stored_core.config)) == 0;
+
+        if (stored_trial.state == MQTT_CONFIG_TRIAL_TESTING &&
+            (active_is_candidate || active_is_previous)) {
+            if (active_is_previous) {
+                stored_core.config = stored_trial.candidate;
+                err = write_core_config_store(&stored_core);
+                if (err != ESP_OK) {
+                    nvs_close(s_nvs_handle);
+                    return err;
+                }
+            }
+            mqtt_trial_pending = true;
+            ESP_LOGW(TAG, "MQTT config dang cho thu ket noi: broker=%s:%u",
+                     stored_trial.candidate.mqtt_broker_host,
+                     (unsigned)stored_trial.candidate.mqtt_broker_port);
+        } else {
+            stored_core.config = stored_trial.previous;
+            err = write_core_config_store(&stored_core);
+            if (err == ESP_OK) {
+                err = erase_mqtt_config_trial_store();
+            }
+            if (err != ESP_OK) {
+                nvs_close(s_nvs_handle);
+                return err;
+            }
+            memset(&stored_trial, 0, sizeof(stored_trial));
+            ESP_LOGW(TAG, "Da hoan tat khoi phuc MQTT config cu sau rollback");
+        }
+    } else if (err == ESP_OK || err == ESP_ERR_NVS_INVALID_LENGTH) {
+        ESP_LOGW(TAG, "MQTT trial NVS khong hop le, bo ban ghi trial");
+        err = erase_mqtt_config_trial_store();
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+        memset(&stored_trial, 0, sizeof(stored_trial));
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(s_nvs_handle);
+        return err;
+    }
+
     uint8_t stored_hash_value = 0U;
     err = nvs_get_u8(s_nvs_handle, HASH_KEY_LOCKED_KEY,
                      &stored_hash_value);
@@ -573,6 +698,8 @@ esp_err_t device_settings_init(void)
 
     portENTER_CRITICAL(&s_core_config_lock);
     s_core_config = stored_core.config;
+    s_mqtt_config_trial = stored_trial;
+    s_mqtt_config_trial_pending = mqtt_trial_pending;
     portEXIT_CRITICAL(&s_core_config_lock);
 
     __atomic_store_n(&s_hash_key_locked, stored_hash_value != 0U,
@@ -624,6 +751,9 @@ esp_err_t device_settings_set_core_config(
     if (!device_settings_core_config_is_valid(config)) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (device_settings_mqtt_config_trial_is_pending()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     device_core_config_t previous;
     portENTER_CRITICAL(&s_core_config_lock);
@@ -657,6 +787,149 @@ esp_err_t device_settings_set_core_config(
              updated.config.node_id,
              updated.config.mqtt_broker_host,
              (unsigned)updated.config.mqtt_broker_port);
+    return ESP_OK;
+}
+
+esp_err_t device_settings_stage_mqtt_config_trial(
+    const device_core_config_t *config)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!device_settings_core_config_is_valid(config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    device_core_config_t previous;
+    bool trial_pending;
+    portENTER_CRITICAL(&s_core_config_lock);
+    previous = s_core_config;
+    trial_pending = s_mqtt_config_trial_pending;
+    portEXIT_CRITICAL(&s_core_config_lock);
+
+    if (trial_pending || strcmp(previous.node_id, config->node_id) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (memcmp(&previous, config, sizeof(previous)) == 0) {
+        return ESP_OK;
+    }
+
+    mqtt_config_trial_store_t trial = {
+        .magic = MQTT_CONFIG_TRIAL_MAGIC,
+        .version = MQTT_CONFIG_TRIAL_VERSION,
+        .state = MQTT_CONFIG_TRIAL_TESTING,
+        .previous = previous,
+        .candidate = *config,
+    };
+    esp_err_t err = write_mqtt_config_trial_store(&trial);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    core_config_store_t updated = {
+        .magic = CORE_CONFIG_MAGIC,
+        .version = CORE_CONFIG_VERSION,
+        .config = *config,
+    };
+    err = write_core_config_store(&updated);
+    if (err != ESP_OK) {
+        trial.state = MQTT_CONFIG_TRIAL_ROLLING_BACK;
+        (void)write_mqtt_config_trial_store(&trial);
+        core_config_store_t restore = {
+            .magic = CORE_CONFIG_MAGIC,
+            .version = CORE_CONFIG_VERSION,
+            .config = previous,
+        };
+        (void)write_core_config_store(&restore);
+        (void)erase_mqtt_config_trial_store();
+        return err;
+    }
+
+    portENTER_CRITICAL(&s_core_config_lock);
+    s_core_config = *config;
+    s_mqtt_config_trial = trial;
+    s_mqtt_config_trial_pending = true;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    ESP_LOGI(TAG, "Da luu MQTT config pending broker=%s:%u; reboot de thu",
+             config->mqtt_broker_host,
+             (unsigned)config->mqtt_broker_port);
+    return ESP_OK;
+}
+
+bool device_settings_mqtt_config_trial_is_pending(void)
+{
+    if (!s_initialized) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_core_config_lock);
+    bool pending = s_mqtt_config_trial_pending;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    return pending;
+}
+
+esp_err_t device_settings_confirm_mqtt_config_trial(void)
+{
+    if (!s_initialized ||
+        !device_settings_mqtt_config_trial_is_pending()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = erase_mqtt_config_trial_store();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    portENTER_CRITICAL(&s_core_config_lock);
+    memset(&s_mqtt_config_trial, 0, sizeof(s_mqtt_config_trial));
+    s_mqtt_config_trial_pending = false;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    ESP_LOGI(TAG, "Da xac nhan MQTT config moi va xoa du lieu rollback");
+    return ESP_OK;
+}
+
+esp_err_t device_settings_rollback_mqtt_config_trial(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mqtt_config_trial_store_t trial;
+    portENTER_CRITICAL(&s_core_config_lock);
+    bool pending = s_mqtt_config_trial_pending;
+    trial = s_mqtt_config_trial;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    if (!pending || !mqtt_config_trial_store_is_valid(&trial)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    trial.state = MQTT_CONFIG_TRIAL_ROLLING_BACK;
+    esp_err_t err = write_mqtt_config_trial_store(&trial);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    core_config_store_t restore = {
+        .magic = CORE_CONFIG_MAGIC,
+        .version = CORE_CONFIG_VERSION,
+        .config = trial.previous,
+    };
+    err = write_core_config_store(&restore);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = erase_mqtt_config_trial_store();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    portENTER_CRITICAL(&s_core_config_lock);
+    s_core_config = trial.previous;
+    memset(&s_mqtt_config_trial, 0, sizeof(s_mqtt_config_trial));
+    s_mqtt_config_trial_pending = false;
+    portEXIT_CRITICAL(&s_core_config_lock);
+    ESP_LOGW(TAG, "Da khoi phuc MQTT config cu broker=%s:%u",
+             trial.previous.mqtt_broker_host,
+             (unsigned)trial.previous.mqtt_broker_port);
     return ESP_OK;
 }
 

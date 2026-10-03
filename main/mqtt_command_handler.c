@@ -16,8 +16,10 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs.h"
 
+#include "device_config.h"
 #include "device_settings.h"
 #include "firmware_version.h"
 #include "mqtt_manager.h"
@@ -1489,6 +1491,90 @@ static esp_err_t publish_calibration_ack(const char *request_id,
     return err;
 }
 
+static bool mqtt_command_host_is_valid(const char *host)
+{
+    if (host == NULL || strstr(host, "://") != NULL) {
+        return false;
+    }
+    size_t length = strnlen(host, DEVICE_MQTT_HOST_MAX_LENGTH + 1U);
+    if (length == 0U || length > DEVICE_MQTT_HOST_MAX_LENGTH) {
+        return false;
+    }
+    for (size_t index = 0U; index < length; index++) {
+        unsigned char character = (unsigned char)host[index];
+        if (character <= 0x20U || character == 0x7FU) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t publish_mqtt_config_ack(
+    const char *request_id,
+    const device_core_config_t *config,
+    const char *description)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    if (root == NULL || reported == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool reported_built =
+        cJSON_AddStringToObject(reported, "mqtt_broker_host",
+                               config->mqtt_broker_host) != NULL &&
+        cJSON_AddNumberToObject(reported, "mqtt_broker_port",
+                               config->mqtt_broker_port) != NULL &&
+        cJSON_AddStringToObject(reported, "mqtt_username",
+                               config->mqtt_username) != NULL &&
+        cJSON_AddBoolToObject(reported, "password_configured", true) != NULL;
+    bool root_built = reported_built &&
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               MQTT_PROTOCOL_VERSION) != NULL &&
+        cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "ack_to", "set_mqtt_config") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL &&
+        cJSON_AddStringToObject(root, "description", description) != NULL;
+    bool reported_attached = root_built &&
+                             cJSON_AddItemToObject(root, "reported", reported);
+    bool built = reported_attached &&
+                 cJSON_AddStringToObject(root, "time_device",
+                                         snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = mqtt_manager_publish_ack(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "ACK MQTT config queued: broker=%s:%u username=%s "
+                 "description=%s",
+                 config->mqtt_broker_host,
+                 (unsigned)config->mqtt_broker_port,
+                 config->mqtt_username, description);
+    }
+    cJSON_free(payload);
+    return err;
+}
+
 static void process_command(const command_message_t *message)
 {
     cJSON *root = cJSON_ParseWithLength(message->payload, message->length);
@@ -1535,6 +1621,115 @@ static void process_command(const command_message_t *message)
         cJSON_IsString(version) &&
         strcmp(version->valuestring, MQTT_PROTOCOL_VERSION) == 0 &&
         cJSON_IsObject(param);
+
+    if (strcmp(command->valuestring, "set_mqtt_config") == 0) {
+        const cJSON *host = cJSON_IsObject(param)
+                                ? cJSON_GetObjectItemCaseSensitive(
+                                      param, "mqtt_broker_host")
+                                : NULL;
+        const cJSON *port = cJSON_IsObject(param)
+                                ? cJSON_GetObjectItemCaseSensitive(
+                                      param, "mqtt_broker_port")
+                                : NULL;
+        const cJSON *username = cJSON_IsObject(param)
+                                    ? cJSON_GetObjectItemCaseSensitive(
+                                          param, "mqtt_username")
+                                    : NULL;
+        const cJSON *password = cJSON_IsObject(param)
+                                    ? cJSON_GetObjectItemCaseSensitive(
+                                          param, "mqtt_password")
+                                    : NULL;
+        bool param_valid = envelope_valid &&
+            string_field_is_valid(host, DEVICE_MQTT_HOST_MAX_LENGTH) &&
+            mqtt_command_host_is_valid(host->valuestring) &&
+            cJSON_IsNumber(port) && port->valuedouble >= 1.0 &&
+            port->valuedouble <= 65535.0 &&
+            floor(port->valuedouble) == port->valuedouble &&
+            string_field_is_valid(username,
+                                  DEVICE_MQTT_USERNAME_MAX_LENGTH) &&
+            string_field_is_valid(password,
+                                  DEVICE_MQTT_PASSWORD_MAX_LENGTH);
+        if (!param_valid) {
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        device_core_config_t current = {0};
+        esp_err_t err = device_settings_get_core_config(&current);
+        if (err != ESP_OK) {
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "internal_error", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        device_core_config_t candidate = current;
+        strlcpy(candidate.mqtt_broker_host, host->valuestring,
+                sizeof(candidate.mqtt_broker_host));
+        candidate.mqtt_broker_port = (uint16_t)port->valuedouble;
+        strlcpy(candidate.mqtt_username, username->valuestring,
+                sizeof(candidate.mqtt_username));
+        strlcpy(candidate.mqtt_password, password->valuestring,
+                sizeof(candidate.mqtt_password));
+
+        bool unchanged = memcmp(&candidate, &current, sizeof(candidate)) == 0;
+        if (!unchanged) {
+            err = device_settings_stage_mqtt_config_trial(&candidate);
+        }
+        if (err != ESP_OK) {
+            const char *description =
+                err == ESP_ERR_INVALID_STATE ? "busy" : "storage_error";
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", description, false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_mqtt_config_ack(
+            request_id->valuestring, &candidate,
+            unchanged ? "mqtt_config_unchanged" : "mqtt_config_staged");
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Publish ACK set_mqtt_config that bai: %s",
+                     esp_err_to_name(err));
+            if (!unchanged) {
+                esp_err_t rollback_err =
+                    device_settings_rollback_mqtt_config_trial();
+                if (rollback_err != ESP_OK) {
+                    ESP_LOGE(TAG, "Khong rollback duoc MQTT config pending: %s",
+                             esp_err_to_name(rollback_err));
+                }
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        remember_request(request_id->valuestring);
+        cJSON_Delete(root);
+        if (!unchanged) {
+            ESP_LOGI(TAG, "Se reboot sau %u ms de thu MQTT config moi",
+                     (unsigned)MQTT_CONFIG_APPLY_REBOOT_DELAY_MS);
+            vTaskDelay(pdMS_TO_TICKS(MQTT_CONFIG_APPLY_REBOOT_DELAY_MS));
+            esp_restart();
+        }
+        return;
+    }
 
     if (strcmp(command->valuestring, "OTA") == 0) {
         if (!envelope_valid || cJSON_GetArraySize(param) != 0) {
@@ -2182,6 +2377,7 @@ static void command_callback(const char *payload, size_t length)
     if (xQueueSend(s_command_queue, &message, 0) != pdTRUE) {
         ESP_LOGE(TAG, "Command queue day, bo qua payload moi");
     }
+    memset(&message, 0, sizeof(message));
 }
 
 static void command_task(void *argument)
@@ -2192,12 +2388,14 @@ static void command_task(void *argument)
         if (xQueueReceive(s_command_queue, &message, portMAX_DELAY) == pdTRUE) {
             if (message.type == COMMAND_MESSAGE_MODE_RESTORE) {
                 process_mode_restore(message.generation);
+                memset(&message, 0, sizeof(message));
                 continue;
             }
             while (!time_manager_is_valid() || !mqtt_manager_is_ready()) {
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
             process_command(&message);
+            memset(&message, 0, sizeof(message));
         }
     }
 }

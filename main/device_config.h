@@ -15,6 +15,8 @@
 #define MQTT_PASSWORD       "123456789"
 
 #define MQTT_CLEAN_SESSION  1
+#define MQTT_CONFIG_TRIAL_TIMEOUT_MS       60000U
+#define MQTT_CONFIG_APPLY_REBOOT_DELAY_MS  2000U
 
 /* Public GitHub Raw release files. Private repositories require authentication. */
 #define OTA_GITHUB_RAW_BASE \

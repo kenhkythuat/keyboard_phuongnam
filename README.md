@@ -282,6 +282,7 @@ Không log password Wi-Fi.
 |---|---|---|
 | `wifi_cfg` | `credentials` | SSID/password đã xác nhận |
 | `device_cfg` | `core_cfg` | `node_id`, MQTT host/port, username/password |
+| `device_cfg` | `mqtt_trial` | Cấu hình MQTT cũ/mới trong thời gian thử và rollback |
 | `device_cfg` | `hash_lock` | Trạng thái khóa phím `#` |
 | `device_cfg` | `price_lock` | Trạng thái khóa sửa giá |
 | `device_cfg` | `cal_mode` | `mode_calibration`, mặc định `P1E` |
@@ -293,6 +294,37 @@ Không log password Wi-Fi.
 `main/device_config.h` chỉ chứa giá trị seed dùng khi xuất xưởng. Lần boot đầu tiên ghi và readback cấu hình lõi vào NVS. Các lần boot sau, MQTT luôn lấy cấu hình từ NVS; thay đổi macro trong một firmware OTA không ghi đè thiết bị đã provision.
 
 Các API `device_settings_get_core_config()` và `device_settings_set_core_config()` là điểm đọc/ghi duy nhất cho cấu hình lõi. API ghi chỉ cập nhật RAM sau khi commit và readback NVS thành công. Cấu hình MQTT mới có hiệu lực sau reboot để tránh tạo nhiều MQTT client.
+
+### Đổi cấu hình MQTT từ xa
+
+Publish command vào topic `tbmq/keyboard/<node_id>/command`:
+
+```json
+{
+  "ts": 1789117208,
+  "version": "1.3",
+  "request_id": "cmd-change-mqtt-001",
+  "cmd": "set_mqtt_config",
+  "param": {
+    "mqtt_broker_host": "mqtt.example.com",
+    "mqtt_broker_port": 1883,
+    "mqtt_username": "node_kbd_003",
+    "mqtt_password": "new-secret"
+  }
+}
+```
+
+`mqtt_broker_host` chỉ nhận hostname hoặc IP, không kèm `mqtt://`. Port hợp lệ từ `1` đến `65535`; username và password không được rỗng. Firmware không in password và không đưa password vào ACK.
+
+Sau khi commit và readback NVS thành công, Node ACK qua broker cũ với `result=ok`, `description=mqtt_config_staged`, rồi reboot sau 2 giây. ACK `reported` gồm host, port, username và `password_configured=true`. Nếu payload giống cấu hình đang dùng, Node trả `mqtt_config_unchanged` và không reboot.
+
+Sau reboot, timeout thử MQTT 60 giây chỉ bắt đầu khi Wi-Fi đã có IP:
+
+1. Kết nối và subscribe command thành công: xóa `mqtt_trial`, giữ cấu hình mới.
+2. Không MQTT-ready trong 60 giây: khôi phục `core_cfg` cũ và reboot.
+3. Mất điện giữa lúc cập nhật/rollback: trạng thái trong `mqtt_trial` được tiếp tục xử lý ở lần boot sau.
+
+Không tắt broker hoặc credential cũ trước khi Node đã nhận ACK staging. Nên thử trước bằng một credential mới còn hiệu lực trên cùng broker, rồi mới chuyển host ở đợt tiếp theo.
 
 ## Partition và OTA
 

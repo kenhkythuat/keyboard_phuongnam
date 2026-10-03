@@ -45,6 +45,11 @@ bool device_settings_core_config_is_valid(
 esp_err_t device_settings_get_core_config(device_core_config_t *config);
 esp_err_t device_settings_set_core_config(
     const device_core_config_t *config);
+esp_err_t device_settings_stage_mqtt_config_trial(
+    const device_core_config_t *config);
+bool device_settings_mqtt_config_trial_is_pending(void);
+esp_err_t device_settings_confirm_mqtt_config_trial(void);
+esp_err_t device_settings_rollback_mqtt_config_trial(void);
 bool device_settings_is_hash_key_locked(void);
 esp_err_t device_settings_set_hash_key_locked(bool locked);
 bool device_settings_is_price_edit_locked(void);
