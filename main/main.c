@@ -13,6 +13,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 
 #include "device_config.h"
 #include "device_settings.h"
@@ -1185,41 +1186,70 @@ static void keypad_scan_task(void *argument)
     }
 }
 
+static esp_err_t initialize_nvs_before_network(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS can khoi tao lai truoc khi ap dung mode boot");
+        err = nvs_flash_erase();
+        if (err == ESP_OK) {
+            err = nvs_flash_init();
+        }
+    }
+    return err;
+}
+
+static esp_err_t reapply_calibration_mode_on_boot(void)
+{
+    char mode[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+    esp_err_t err = device_settings_get_mode_calibration(mode, sizeof(mode));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    calibration_mapping_t mapping = {0};
+    bool mapping_found = false;
+    for (uint8_t slot = 1U; slot <= CALIBRATION_MAPPING_MAX_COUNT; slot++) {
+        if (device_settings_get_calibration_mapping_at(slot, &mapping) ==
+                ESP_OK &&
+            strcmp(mapping.name, mode) == 0) {
+            mapping_found = true;
+            break;
+        }
+    }
+    if (!mapping_found) {
+        ESP_LOGW(TAG,
+                 "Mode boot %s chua co calibration mapping, bo qua ap dung lai",
+                 mode);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    ESP_LOGI(TAG, "Ap dung lai mode boot %s voi raw_command=%s",
+             mode, mapping.raw_command);
+    err = execute_calibration_command(mapping.raw_command);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Da ap dung lai mode boot %s truoc khi bat Wi-Fi", mode);
+    } else {
+        ESP_LOGE(TAG, "Ap dung lai mode boot %s that bai: %s",
+                 mode, esp_err_to_name(err));
+    }
+    return err;
+}
+
 void app_main(void)
 {
     virtual_led_enable_init();
 
-    esp_err_t wifi_result = wifi_manager_start();
-    if (wifi_result != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    esp_err_t nvs_result = initialize_nvs_before_network();
+    if (nvs_result != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_result));
     }
 
     esp_err_t settings_result = device_settings_init();
     if (settings_result != ESP_OK) {
         ESP_LOGE(TAG, "Device settings init failed: %s",
                  esp_err_to_name(settings_result));
-    }
-
-    esp_err_t time_result = time_manager_start();
-    if (time_result != ESP_OK) {
-        ESP_LOGE(TAG, "Time manager init failed: %s", esp_err_to_name(time_result));
-    }
-
-    esp_err_t mqtt_result = mqtt_manager_start();
-    if (mqtt_result != ESP_OK) {
-        ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
-    }
-
-    esp_err_t ota_result = ota_manager_start();
-    if (ota_result != ESP_OK) {
-        ESP_LOGE(TAG, "OTA manager init failed: %s",
-                 esp_err_to_name(ota_result));
-    }
-
-    esp_err_t heartbeat_result = telemetry_heartbeat_start();
-    if (heartbeat_result != ESP_OK) {
-        ESP_LOGE(TAG, "Telemetry heartbeat init failed: %s",
-                 esp_err_to_name(heartbeat_result));
     }
 
 #if ENABLE_PUMP_DATA_SNIFFER
@@ -1244,6 +1274,37 @@ void app_main(void)
     if (command_result != ESP_OK) {
         ESP_LOGE(TAG, "MQTT command handler init failed: %s",
                  esp_err_to_name(command_result));
+    }
+
+    if (settings_result == ESP_OK && command_result == ESP_OK) {
+        (void)reapply_calibration_mode_on_boot();
+    }
+
+    esp_err_t wifi_result = wifi_manager_start();
+    if (wifi_result != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi manager init failed: %s", esp_err_to_name(wifi_result));
+    }
+
+    esp_err_t time_result = time_manager_start();
+    if (time_result != ESP_OK) {
+        ESP_LOGE(TAG, "Time manager init failed: %s", esp_err_to_name(time_result));
+    }
+
+    esp_err_t mqtt_result = mqtt_manager_start();
+    if (mqtt_result != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
+    }
+
+    esp_err_t ota_result = ota_manager_start();
+    if (ota_result != ESP_OK) {
+        ESP_LOGE(TAG, "OTA manager init failed: %s",
+                 esp_err_to_name(ota_result));
+    }
+
+    esp_err_t heartbeat_result = telemetry_heartbeat_start();
+    if (heartbeat_result != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry heartbeat init failed: %s",
+                 esp_err_to_name(heartbeat_result));
     }
 
     esp_err_t totalizer_view_result = totalizer_view_start();

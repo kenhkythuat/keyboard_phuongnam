@@ -355,6 +355,31 @@ static transaction_report_result_t report_completed_transaction(
     return TRANSACTION_REPORT_DONE;
 }
 
+static transaction_report_result_t finalize_transaction(
+    const pump_transaction_t *transaction)
+{
+    transaction_report_result_t report_result =
+        report_completed_transaction(transaction, false);
+    if (report_result == TRANSACTION_REPORT_RETRY) {
+        esp_err_t store_result = pump_transaction_store_append(transaction);
+        if (store_result == ESP_OK) {
+            ESP_LOGI(
+                TAG,
+                "Da luu giao dich vao Flash, dang cho gui=%u",
+                (unsigned)pump_transaction_store_count()
+            );
+        } else {
+            ESP_LOGE(TAG, "Khong luu duoc giao dich vao Flash: %s",
+                     esp_err_to_name(store_result));
+        }
+    }
+    if (report_result != TRANSACTION_REPORT_INVALID) {
+        mqtt_command_handler_notify_transaction_complete(
+            transaction->command_code);
+    }
+    return report_result;
+}
+
 static void pump_transaction_filter_task(void *argument)
 {
     (void)argument;
@@ -442,6 +467,17 @@ static void pump_transaction_filter_task(void *argument)
                 transaction.unit_price > 0U;
 
             if (is_transaction_start) {
+                if (transaction_active && has_sale_data) {
+                    ESP_LOGI(
+                        TAG,
+                        "Man hinh ve 0/0.00, chot giao dich truoc moc %u ms",
+                        (unsigned int)PUMP_DATA_STABLE_TIME_MS
+                    );
+                    (void)finalize_transaction(&latest_transaction);
+                    idle_positive_transaction = latest_transaction;
+                    has_idle_positive_transaction = true;
+                }
+
                 esp_err_t mode_result = device_settings_get_mode_calibration(
                     transaction.command_code,
                     sizeof(transaction.command_code));
@@ -601,26 +637,7 @@ static void pump_transaction_filter_task(void *argument)
             "Du lieu bom da dung thay doi trong %u ms",
             (unsigned int)PUMP_DATA_STABLE_TIME_MS
         );
-        transaction_report_result_t report_result =
-            report_completed_transaction(&latest_transaction, false);
-        if (report_result == TRANSACTION_REPORT_RETRY) {
-            esp_err_t store_result = pump_transaction_store_append(
-                &latest_transaction);
-            if (store_result == ESP_OK) {
-                ESP_LOGI(
-                    TAG,
-                    "Da luu giao dich vao Flash, dang cho gui=%u",
-                    (unsigned)pump_transaction_store_count()
-                );
-            } else {
-                ESP_LOGE(TAG, "Khong luu duoc giao dich vao Flash: %s",
-                         esp_err_to_name(store_result));
-            }
-        }
-        if (report_result != TRANSACTION_REPORT_INVALID) {
-            mqtt_command_handler_notify_transaction_complete(
-                latest_transaction.command_code);
-        }
+        (void)finalize_transaction(&latest_transaction);
 
         idle_positive_transaction = latest_transaction;
         has_idle_positive_transaction = true;

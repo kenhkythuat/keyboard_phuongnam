@@ -148,16 +148,20 @@ Nhấn giữ IO0 ổn định hơn 7 giây để mở SoftAP và Web Portal.
 `app_main()` khởi động theo thứ tự chính:
 
 1. Đặt IO39 về `0`.
-2. Khởi động `wifi_manager` và NVS.
-3. Load `device_settings`.
-4. Khởi động `time_manager`.
-5. Khởi động `mqtt_manager`.
-6. Khởi động heartbeat.
-7. Khởi động sniffer và transaction filter.
-8. Khởi tạo keypad và virtual key output.
-9. Tạo task shortcut, MQTT command, P88, Wi-Fi status LED và keypad scan.
+2. Khởi tạo NVS và load `device_settings`.
+3. Khởi động sniffer và transaction filter.
+4. Khởi tạo keypad và virtual key output.
+5. Khởi tạo state machine MQTT command/calibration.
+6. Đọc `mode_calibration` từ NVS, tìm `raw_command` trong 5 calibration
+   mapping và áp dụng lại mode đang lưu.
+7. Sau khi hoàn tất bước áp dụng mode mới khởi động `wifi_manager`,
+   `time_manager`, `mqtt_manager`, OTA và heartbeat.
+8. Tạo task P88, Wi-Fi status LED và keypad scan.
 
-Các module mạng đều event-driven. `app_main()` không chờ Wi-Fi, SNTP hoặc MQTT.
+Việc áp dụng lại mode lúc boot chạy trước Wi-Fi và dùng retry/verify calibration
+hiện có. Nếu mode mặc định chưa có mapping hoặc verify thất bại, firmware ghi
+log rồi vẫn tiếp tục start network. Các module mạng vẫn event-driven;
+`app_main()` không chờ Wi-Fi, SNTP hoặc MQTT kết nối.
 
 ## Luồng giải mã LED
 
@@ -204,7 +208,10 @@ Sau đó firmware theo dõi mẫu dương:
 - nếu có nhiều mẫu thì xác nhận tiền/lít tăng không giảm;
 - nếu lượt bơm rất nhanh chỉ có một mẫu kết quả, mẫu đó vẫn được nhận nếu khác màn hình dương trước khi về `0/0`;
 - nếu màn hình quay lại đúng giao dịch cũ thì không phát lại;
-- kết quả phải đứng yên 10 giây;
+- kết quả được chốt khi đứng yên 10 giây, hoặc chốt ngay nếu màn hình chuyển
+  về `0/0.00` để bắt đầu lượt bơm kế tiếp;
+- mẫu dương đầu tiên trùng màn hình trước lúc về `0/0.00` vẫn được xem là dữ
+  liệu cũ khôi phục và không được gửi;
 - công thức kiểm tra:
 
 ```c

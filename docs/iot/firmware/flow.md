@@ -5,28 +5,31 @@
 ```mermaid
 sequenceDiagram
     participant Boot as app_main
-    participant WiFi as wifi_manager
     participant Settings as device_settings
+    participant Key as Virtual key + LED sniffer
+    participant Calibration as calibration flow
+    participant WiFi as wifi_manager
     participant Time as time_manager
     participant MQTT as mqtt_manager
     participant App as Application tasks
 
-    Boot->>WiFi: start()
-    WiFi->>WiFi: init NVS, load credentials
-    alt Wi-Fi credential chưa có
-        WiFi->>WiFi: seed factory credential + readback
-    end
-    WiFi-->>Boot: return ngay
+    Boot->>Boot: init NVS
     Boot->>Settings: init()
     alt core_cfg chưa có/không hợp lệ
         Settings->>Settings: seed factory core config + readback
     else core_cfg hợp lệ
         Settings->>Settings: load node/MQTT config + command settings
     end
+    Boot->>Key: start sniffer + init virtual key GPIO
+    Boot->>Calibration: load cal_mode và mapping từ NVS
+    Calibration->>Key: áp dụng lại raw_command, verify tối đa 3 lần
+    Calibration-->>Boot: success hoặc log lỗi và tiếp tục
+    Boot->>WiFi: start()
+    WiFi->>WiFi: load credentials và connect STA
+    WiFi-->>Boot: return ngay
     Boot->>Time: start SNTP manager
     Boot->>MQTT: init client bằng core_cfg từ NVS
-    Boot->>App: start heartbeat/sniffer/keypad/command tasks
-    WiFi->>WiFi: connect STA
+    Boot->>App: start heartbeat/P88/status LED/keypad scan
     WiFi-->>Time: IP_EVENT_STA_GOT_IP
     Time->>Time: start/restart SNTP
     WiFi-->>MQTT: IP_EVENT_STA_GOT_IP
