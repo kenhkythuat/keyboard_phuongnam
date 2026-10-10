@@ -131,13 +131,14 @@ Các `result` hiện dùng: `ok`, `error`, `rejected`.
 ```
 
 - Khoảng hợp lệ: 1..999999, integer.
-- ACK `unit_price_accepted` được gửi trước khi thực thi.
-- Chuỗi phím: `#44504EP` + giá + `E`.
+- Chuỗi phím: `C#44504EP` + giá + `E`.
 - Xác nhận LED: hàng 1 là `E0`, hàng 3 đúng giá.
-- Thành công mới gửi `C`; retry tối đa 3 lần.
-- Khoảng phím mặc định 500 ms.
-
-Lưu ý: code hiện không gửi ACK cuối thứ hai nếu thao tác thực tế thất bại sau ACK accepted.
+- Retry toàn bộ tối đa 3 lần; mỗi lần retry bắt đầu bằng `C`.
+- Kết thúc thành công hoặc thất bại đều gửi `CC` để thoát.
+- Chỉ ACK sau khi verify và gửi `CC`: thành công dùng `result=ok`,
+  `description=unit_price_updated`; thất bại dùng `result=error`,
+  `description=verification_failed`.
+- Mỗi phím giữ 50 ms, khoảng giữa hai phím 40 ms.
 
 ### 6.4 `get_totalizer`
 

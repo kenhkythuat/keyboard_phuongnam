@@ -16,6 +16,7 @@
 #include "wifi_manager.h"
 
 #define TELEMETRY_HEARTBEAT_PERIOD_MS       60000U
+#define TELEMETRY_HEARTBEAT_RETRY_MS        1000U
 #define TELEMETRY_HEARTBEAT_TASK_STACK_SIZE 3072U
 #define TELEMETRY_HEARTBEAT_TASK_PRIORITY   3U
 #define TELEMETRY_HEARTBEAT_VALUE           1
@@ -29,32 +30,26 @@ static esp_err_t publish_heartbeat(void)
 {
     const char *firmware_version = firmware_version_get();
 
+    if (!mqtt_manager_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     int64_t timestamp = time_manager_get_timestamp();
     if (timestamp <= 0) {
-        ESP_LOGW(TAG, "Bo qua heartbeat: thoi gian chua hop le");
-        return ESP_ERR_INVALID_STATE;
+        timestamp = 0;
     }
 
     int8_t rssi = 0;
     esp_err_t err = wifi_manager_get_rssi(&rssi);
     if (err != ESP_OK || rssi < WIFI_RSSI_MIN_DBM ||
         rssi > WIFI_RSSI_MAX_DBM) {
-        ESP_LOGW(TAG, "Bo qua heartbeat: RSSI khong hop le (%s, %d dBm)",
-                 esp_err_to_name(err), (int)rssi);
-        return err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : err;
-    }
-
-    if (!mqtt_manager_is_ready()) {
-        ESP_LOGW(TAG, "Bo qua heartbeat: MQTT chua ready");
-        return ESP_ERR_INVALID_STATE;
+        rssi = 0;
     }
 
     uint32_t unit_price = 0U;
     err = pump_transaction_filter_get_unit_price(&unit_price);
     if (err != ESP_OK || unit_price == 0U) {
-        ESP_LOGW(TAG, "Bo qua heartbeat: unit_price chua hop le (%s)",
-                 esp_err_to_name(err));
-        return err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : err;
+        unit_price = 0U;
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -108,12 +103,13 @@ static void telemetry_heartbeat_task(void *argument)
 {
     (void)argument;
 
-    TickType_t last_wake_time = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(TELEMETRY_HEARTBEAT_PERIOD_MS);
+    const TickType_t retry_delay =
+        pdMS_TO_TICKS(TELEMETRY_HEARTBEAT_RETRY_MS);
 
     while (true) {
-        vTaskDelayUntil(&last_wake_time, period);
-        (void)publish_heartbeat();
+        esp_err_t err = publish_heartbeat();
+        vTaskDelay(err == ESP_OK ? period : retry_delay);
     }
 }
 

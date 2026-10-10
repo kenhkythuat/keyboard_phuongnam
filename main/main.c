@@ -39,7 +39,7 @@ static const char *TAG = "KEY_OUTPUT";
 #define ENABLE_VIRTUAL_LED_GPIO     GPIO_NUM_39
 
 #define AUTO_KEY_SEQUENCE              "#122973E2522EC"
-#define AUTO_KEY_HOLD_TIME_MS          50
+#define AUTO_KEY_HOLD_TIME_MS          60
 #define AUTO_KEY_DELAY_BETWEEN_MS      50
 #define AUTO_KEY_REPEAT_DELAY_MS       2000
 #define SHORTCUT_OUTPUT_INTERVAL_MS    500U

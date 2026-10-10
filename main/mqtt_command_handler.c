@@ -35,7 +35,7 @@
 #define REQUEST_ID_MAX_LENGTH       64U
 #define COMMAND_NAME_MAX_LENGTH     48U
 #define DEDUP_HISTORY_LENGTH        16U
-#define VIRTUAL_KEY_INTERVAL_MS     40U
+#define VIRTUAL_KEY_INTERVAL_MS     60U
 #define SET_UNIT_PRICE_MAX          999999U
 #define SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH 24U
 #define SET_UNIT_PRICE_MAX_ATTEMPTS  3U
@@ -1163,11 +1163,12 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
 {
     char entry_sequence[SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH];
     int written = snprintf(entry_sequence, sizeof(entry_sequence),
-                           "#44504EP%" PRIu32, unit_price);
+                           "C#44504EP%" PRIu32, unit_price);
     if (written < 0 || (size_t)written >= sizeof(entry_sequence)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
+    esp_err_t result = ESP_ERR_INVALID_RESPONSE;
     for (uint32_t attempt = 1U; attempt <= SET_UNIT_PRICE_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "set_unit_price lan %u/%u: sequence=%sE",
                  (unsigned)attempt,
@@ -1177,7 +1178,8 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
         esp_err_t err = virtual_key_output_run_sequence(
             entry_sequence, VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
-            return err;
+            result = err;
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
@@ -1188,15 +1190,15 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
 
         err = virtual_key_output_run_sequence("E", VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
-            return err;
+            result = err;
+            break;
         }
 
         if (wait_for_unit_price_confirmation(unit_price, baseline_generation)) {
             ESP_LOGI(TAG, "Xac nhan man hinh E0 va unit_price=%" PRIu32,
                      unit_price);
-            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
-            return virtual_key_output_run_sequence(
-                "C", VIRTUAL_KEY_INTERVAL_MS);
+            result = ESP_OK;
+            break;
         }
 
         ESP_LOGW(TAG, "Khong xac nhan duoc E0/unit_price=%" PRIu32
@@ -1204,7 +1206,15 @@ static esp_err_t execute_set_unit_price(uint32_t unit_price)
                  unit_price, (unsigned)attempt);
     }
 
-    return ESP_ERR_INVALID_RESPONSE;
+    vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+    esp_err_t exit_err = virtual_key_output_run_sequence(
+        "CC", VIRTUAL_KEY_INTERVAL_MS);
+    if (exit_err != ESP_OK) {
+        ESP_LOGE(TAG, "Khong the nhan CC de thoat set_unit_price: %s",
+                 esp_err_to_name(exit_err));
+        return exit_err;
+    }
+    return result;
 }
 
 static esp_err_t publish_ack(const char *request_id,
@@ -2160,31 +2170,32 @@ static void process_command(const command_message_t *message)
         }
 
         uint32_t unit_price = (uint32_t)unit_price_item->valuedouble;
-        esp_err_t err = publish_ack(
-            request_id->valuestring, command->valuestring,
-            "ok", "unit_price_accepted", true, unit_price, false, false,
-            false, 0U, 0.0);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Publish ACK set_unit_price that bai: %s",
-                     esp_err_to_name(err));
-            cJSON_Delete(root);
-            return;
-        }
-
-        remember_request(request_id->valuestring);
-
         ESP_LOGI(TAG, "Thuc thi set_unit_price=%" PRIu32
                       ", interval=%u ms, max_attempts=%u",
                  unit_price,
                  (unsigned)VIRTUAL_KEY_INTERVAL_MS,
                  (unsigned)SET_UNIT_PRICE_MAX_ATTEMPTS);
-        err = execute_set_unit_price(unit_price);
-        if (err != ESP_OK) {
+        esp_err_t execute_err = execute_set_unit_price(unit_price);
+        const bool applied = execute_err == ESP_OK;
+        if (!applied) {
             ESP_LOGE(TAG, "SET_UNIT_PRICE THAT BAI sau %u lan: %s",
                      (unsigned)SET_UNIT_PRICE_MAX_ATTEMPTS,
-                     esp_err_to_name(err));
+                     esp_err_to_name(execute_err));
         } else {
             ESP_LOGI(TAG, "Da hoan thanh chuoi phim set_unit_price");
+        }
+
+        esp_err_t ack_err = publish_ack(
+            request_id->valuestring, command->valuestring,
+            applied ? "ok" : "error",
+            applied ? "unit_price_updated" : "verification_failed",
+            applied, unit_price, false, false,
+            false, 0U, 0.0);
+        if (ack_err == ESP_OK) {
+            remember_request(request_id->valuestring);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK set_unit_price that bai: %s",
+                     esp_err_to_name(ack_err));
         }
         cJSON_Delete(root);
         return;

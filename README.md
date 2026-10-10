@@ -256,6 +256,20 @@ tbmq/keyboard/<node_id>/event
 
 Node chỉ subscribe topic `command` của chính nó. Chi tiết payload và command nằm trong [implementation.md](docs/iot/firmware/implementation.md).
 
+Heartbeat được gửi ngay khi MQTT ready sau boot, sau đó mỗi 60 giây. Trong lúc MQTT chưa ready, task thử lại mỗi 1 giây thay vì chờ hết chu kỳ. `ts`, `RSSI` và `data.unit_price` dùng giá trị `0` nếu thông tin tương ứng chưa lấy được; vì vậy heartbeat vẫn xác nhận thiết bị đang hoạt động ngay cả khi SNTP chưa sync hoặc LED chưa cung cấp đơn giá.
+
+```json
+{
+  "ts": 0,
+  "version": "1.0.5",
+  "keep_alive": 1,
+  "RSSI": 0,
+  "data": {
+    "unit_price": 0
+  }
+}
+```
+
 ## Wi-Fi và Web Portal
 
 - Khi boot, firmware ưu tiên credential trong NVS `wifi_cfg/credentials`.

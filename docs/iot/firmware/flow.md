@@ -171,17 +171,18 @@ Trong P88, bất kỳ phím vật lý nào yêu cầu thoát; firmware trả IO3
 
 ```mermaid
 flowchart TD
-    A[Validate unit_price] --> B[ACK unit_price_accepted]
-    B --> C[Send #44504EP + price]
+    A[Validate unit_price] --> C[Send C#44504EP + price]
     C --> D[Capture generation]
     D --> E[Send E]
     E --> F{Fresh LED: row1 E0 and row3=price?}
-    F -- Yes --> G[Send C, complete]
+    F -- Yes --> G[Send CC]
     F -- No and attempts < 3 --> C
-    F -- No after 3 --> H[Log failure]
+    F -- No after 3 --> H[Send CC]
+    G --> I[ACK ok: unit_price_updated]
+    H --> J[ACK error: verification_failed]
 ```
 
-ACK hiện biểu thị command đã được tiếp nhận, chưa biểu thị thao tác cuối chắc chắn thành công.
+ACK được gửi sau khi thao tác và xác nhận LED hoàn tất, nên phản ánh kết quả cuối.
 
 ## 8. Calibration
 
