@@ -14,6 +14,7 @@
 #define SETTINGS_NAMESPACE       "device_cfg"
 #define HASH_KEY_LOCKED_KEY      "hash_lock"
 #define PRICE_EDIT_LOCKED_KEY    "price_lock"
+#define LAST_UNIT_PRICE_KEY      "last_price"
 #define MODE_CALIBRATION_KEY     "cal_mode"
 #define MODE_RESTORE_KEY         "cal_restore"
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
@@ -33,6 +34,7 @@
 #define CALIBRATION_STORAGE_SLOT_COUNT 10U
 #define MODE_RESTORE_MAGIC       0x4D525354UL
 #define MODE_RESTORE_VERSION     1U
+#define LAST_UNIT_PRICE_MAX      999999U
 
 typedef struct {
     uint32_t magic;
@@ -81,6 +83,7 @@ static const char *TAG = "DEVICE_SETTINGS";
 static nvs_handle_t s_nvs_handle;
 static bool s_hash_key_locked;
 static bool s_price_edit_locked;
+static uint32_t s_last_unit_price;
 static device_core_config_t s_core_config;
 static mqtt_config_trial_store_t s_mqtt_config_trial;
 static bool s_mqtt_config_trial_pending;
@@ -554,6 +557,34 @@ esp_err_t device_settings_init(void)
         return err;
     }
 
+    uint32_t stored_unit_price = 0U;
+    err = nvs_get_u32(s_nvs_handle, LAST_UNIT_PRICE_KEY,
+                      &stored_unit_price);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        stored_unit_price = 0U;
+        err = ESP_OK;
+        ESP_LOGI(TAG,
+                 "Chua co last_unit_price trong NVS, cho du lieu LED hop le");
+    } else if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    } else if (stored_unit_price == 0U ||
+               stored_unit_price > LAST_UNIT_PRICE_MAX) {
+        ESP_LOGW(TAG,
+                 "last_unit_price=%" PRIu32
+                 " trong NVS khong hop le, bo gia tri cache",
+                 stored_unit_price);
+        stored_unit_price = 0U;
+        err = nvs_erase_key(s_nvs_handle, LAST_UNIT_PRICE_KEY);
+        if (err == ESP_OK) {
+            err = nvs_commit(s_nvs_handle);
+        }
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+    }
+
     char stored_mode[sizeof(s_mode_calibration)] = DEFAULT_MODE_CALIBRATION;
     size_t stored_mode_size = 0U;
     bool persist_default_mode = false;
@@ -706,6 +737,8 @@ esp_err_t device_settings_init(void)
                      __ATOMIC_RELEASE);
     __atomic_store_n(&s_price_edit_locked, stored_price_value != 0U,
                      __ATOMIC_RELEASE);
+    __atomic_store_n(&s_last_unit_price, stored_unit_price,
+                     __ATOMIC_RELEASE);
     portENTER_CRITICAL(&s_mode_calibration_lock);
     strlcpy(s_mode_calibration, stored_mode, sizeof(s_mode_calibration));
     portEXIT_CRITICAL(&s_mode_calibration_lock);
@@ -718,6 +751,10 @@ esp_err_t device_settings_init(void)
              stored_hash_value != 0U ? "true" : "false");
     ESP_LOGI(TAG, "Khoi phuc price_edit_locked=%s tu Flash",
              stored_price_value != 0U ? "true" : "false");
+    if (stored_unit_price > 0U) {
+        ESP_LOGI(TAG, "Khoi phuc last_unit_price=%" PRIu32 " tu Flash",
+                 stored_unit_price);
+    }
     ESP_LOGI(TAG, "Khoi phuc %u shortcut mapping, revision=%" PRIu32,
              (unsigned)stored_shortcuts.count, stored_shortcuts.revision);
     ESP_LOGI(TAG, "Khoi phuc %u calibration mapping tu Flash",
@@ -998,6 +1035,61 @@ esp_err_t device_settings_set_price_edit_locked(bool locked)
     __atomic_store_n(&s_price_edit_locked, locked, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "Da luu price_edit_locked=%s vao Flash",
              locked ? "true" : "false");
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_last_unit_price(uint32_t *unit_price)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (unit_price == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t current = __atomic_load_n(&s_last_unit_price,
+                                       __ATOMIC_ACQUIRE);
+    if (current == 0U) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    *unit_price = current;
+    return ESP_OK;
+}
+
+esp_err_t device_settings_set_last_unit_price(uint32_t unit_price)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (unit_price == 0U || unit_price > LAST_UNIT_PRICE_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t current = __atomic_load_n(&s_last_unit_price,
+                                       __ATOMIC_ACQUIRE);
+    if (current == unit_price) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = nvs_set_u32(s_nvs_handle, LAST_UNIT_PRICE_KEY,
+                                unit_price);
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint32_t readback = 0U;
+    err = nvs_get_u32(s_nvs_handle, LAST_UNIT_PRICE_KEY, &readback);
+    if (err != ESP_OK || readback != unit_price) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    __atomic_store_n(&s_last_unit_price, unit_price, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "Da luu last_unit_price=%" PRIu32 " vao Flash",
+             unit_price);
     return ESP_OK;
 }
 

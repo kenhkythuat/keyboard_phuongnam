@@ -25,6 +25,7 @@
 #include "mqtt_manager.h"
 #include "ota_manager.h"
 #include "pump_data_sniffer.h"
+#include "pump_transaction_filter.h"
 #include "time_manager.h"
 #include "virtual_key_output.h"
 
@@ -2183,6 +2184,14 @@ static void process_command(const command_message_t *message)
                      esp_err_to_name(execute_err));
         } else {
             ESP_LOGI(TAG, "Da hoan thanh chuoi phim set_unit_price");
+            esp_err_t cache_err =
+                pump_transaction_filter_update_unit_price(unit_price);
+            if (cache_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "Da doi gia thanh cong nhung khong luu duoc "
+                         "unit_price cache: %s",
+                         esp_err_to_name(cache_err));
+            }
         }
 
         esp_err_t ack_err = publish_ack(

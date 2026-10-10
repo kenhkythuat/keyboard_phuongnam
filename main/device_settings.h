@@ -54,6 +54,8 @@ bool device_settings_is_hash_key_locked(void);
 esp_err_t device_settings_set_hash_key_locked(bool locked);
 bool device_settings_is_price_edit_locked(void);
 esp_err_t device_settings_set_price_edit_locked(bool locked);
+esp_err_t device_settings_get_last_unit_price(uint32_t *unit_price);
+esp_err_t device_settings_set_last_unit_price(uint32_t unit_price);
 esp_err_t device_settings_get_mode_calibration(char *mode, size_t size);
 esp_err_t device_settings_set_mode_calibration(const char *mode);
 esp_err_t device_settings_set_calibration_mode_restore(

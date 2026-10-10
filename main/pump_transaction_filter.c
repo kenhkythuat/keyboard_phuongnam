@@ -54,7 +54,8 @@ static bool segment_to_digit(uint8_t segments, uint8_t *digit, bool *blank)
         return false;
     }
 
-    if (segments == 0xFFU || segments == 0x80U) {
+    /* 0xFF = digit 8 (0x7F) with decimal point (0x80). */
+    if (segments == 0x80U) {
         return false;
     }
 
@@ -456,9 +457,15 @@ static void pump_transaction_filter_task(void *argument)
             }
 
             if (transaction.unit_price > 0U) {
-                __atomic_store_n(&s_current_unit_price,
-                                 transaction.unit_price,
-                                 __ATOMIC_RELEASE);
+                esp_err_t price_result =
+                    pump_transaction_filter_update_unit_price(
+                        transaction.unit_price);
+                if (price_result != ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "Da cap nhat unit_price RAM nhung khong luu "
+                             "duoc NVS: %s",
+                             esp_err_to_name(price_result));
+                }
             }
 
             bool is_transaction_start =
@@ -662,6 +669,19 @@ esp_err_t pump_transaction_filter_start(void)
         return ESP_OK;
     }
 
+    uint32_t cached_unit_price = 0U;
+    esp_err_t cached_price_result =
+        device_settings_get_last_unit_price(&cached_unit_price);
+    if (cached_price_result == ESP_OK) {
+        __atomic_store_n(&s_current_unit_price, cached_unit_price,
+                         __ATOMIC_RELEASE);
+        ESP_LOGI(TAG, "Dung unit_price cache tu NVS: %" PRIu32,
+                 cached_unit_price);
+    } else if (cached_price_result != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Khong doc duoc unit_price cache: %s",
+                 esp_err_to_name(cached_price_result));
+    }
+
     esp_err_t store_result = pump_transaction_store_init();
     if (store_result != ESP_OK) {
         return store_result;
@@ -716,6 +736,19 @@ esp_err_t pump_transaction_filter_get_unit_price(uint32_t *unit_price)
 
     *unit_price = current;
     return ESP_OK;
+}
+
+esp_err_t pump_transaction_filter_update_unit_price(uint32_t unit_price)
+{
+    if (!s_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (unit_price == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    __atomic_store_n(&s_current_unit_price, unit_price, __ATOMIC_RELEASE);
+    return device_settings_set_last_unit_price(unit_price);
 }
 
 bool pump_transaction_filter_submit(
