@@ -337,14 +337,11 @@ static char segment_to_character(uint8_t segments)
 static inline bool is_known_segment(uint8_t segments)
 {
     /*
-     * 0xFF thuong la du lieu bi doc sai/duong data idle high.
-     * Neu chap nhan no, ham segment_to_character() se xem thanh "8."
-     * va lam bo ghep man hinh xac nhan nham.
+     * 0xFF la ma hop le cua so 8 kem dau cham:
+     * 0x7F (8) | 0x80 (DP). Khong duoc loai rieng byte nay,
+     * neu khong cac gia tri nhu 18.000/28.000/38.000 se mat cot.
+     * Mau bus U1 idle-high 0xFFFF duoc loc theo ngu canh ben duoi.
      */
-    if (segments == 0xFFU) {
-        return false;
-    }
-
     return segment_to_character(segments) != '?';
 }
 
@@ -457,6 +454,16 @@ static void evaluate_bit_offset(
             continue;
         }
 #endif
+
+        /*
+         * U1=0xFFFF thuong la ca hai byte data dang idle-high, khong phai
+         * hai ky tu "8." that. Chi loai ca word nay thay vi loai tung byte
+         * 0xFF, de row1/row2 van co the hien thi mot so 8 kem dau cham va
+         * row3 co the dung 0xFF trong mot block U2 da co column mask hop le.
+         */
+        if (u1_word == 0xFFFFU) {
+            continue;
+        }
 
         if (!is_known_segment(row1) ||
             !is_known_segment(row2) ||
