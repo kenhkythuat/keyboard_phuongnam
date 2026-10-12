@@ -21,7 +21,7 @@
 #include "time_manager.h"
 #include "wifi_manager.h"
 
-#define PUMP_DATA_STABLE_TIME_MS   10000U
+#define PUMP_DATA_STABLE_TIME_MS   50000U
 #define AMOUNT_TOLERANCE_VND       200.0f
 #define FILTER_TASK_STACK_SIZE     4096U
 #define FILTER_TASK_PRIORITY       5U
