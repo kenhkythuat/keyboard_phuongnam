@@ -138,7 +138,8 @@ Các `result` hiện dùng: `ok`, `error`, `rejected`.
 - Chỉ ACK sau khi verify và gửi `CC`: thành công dùng `result=ok`,
   `description=unit_price_updated`; thất bại dùng `result=error`,
   `description=verification_failed`.
-- Mỗi phím giữ 50 ms, khoảng giữa hai phím 40 ms.
+- Mỗi phím giữ `AUTO_KEY_HOLD_TIME_MS=60 ms`; khoảng nghỉ giữa hai phím
+  của command là `VIRTUAL_KEY_INTERVAL_MS=60 ms`.
 
 ### 6.4 `get_totalizer`
 
@@ -160,6 +161,137 @@ Mỗi phần retry tối đa 3 lần. Cả hai thành công mới:
 
 - ACK `totalizer_read_success` với hai giá trị trong `reported`;
 - publish thêm totalizer telemetry.
+
+#### Cách đọc tổng tiền
+
+Implementation dùng `read_total_amount()` và chỉ chấp nhận snapshot LED mới:
+
+1. Gửi `C#7733`.
+2. Chờ một khoảng phím, lưu `baseline_generation` của LED decoder.
+3. Gửi `E`.
+4. Poll snapshot mỗi 50 ms, tối đa 3000 ms.
+5. Bỏ qua snapshot có `generation` bằng baseline để không dùng dữ liệu cũ.
+6. Kiểm tra hàng 1: cột 1-3 trống, cột 4-6 đúng `P20`.
+7. Giải mã hàng 2 từ trái sang phải. Ô trống được bỏ qua; các ô còn lại phải
+   là số `0-9`.
+8. Lấy DP mask của cả 6 cột để xác định hệ số phần giá trị bị ẩn khỏi màn hình.
+9. Nhân dãy số đang thấy với hệ số, lưu vào `uint64_t total_amount_vnd`, đồng
+   thời giữ nguyên 6 byte segment hàng 2 để hiển thị local, rồi gửi `C`.
+
+Bảng hệ số tổng tiền theo đúng format màn hình hiện tại:
+
+| DP trên hàng 2 | Ví dụ 6 chữ số | Hệ số | `total_amount_vnd` |
+|---|---:|---:|---:|
+| Chỉ cột 3 | `110.450` | `1` | `110450` |
+| Cột 1 và cột 4 | `1.104.50` | `10` | `1104500` |
+| Không có DP | `110450` | `10000` | `1104500000` |
+| Chỉ cột 1 | `1.10450` | `10000` | `1104500000` |
+
+Mẫu DP khác bốn trường hợp trên bị từ chối để tránh gửi sai tổng tiền.
+
+Ví dụ:
+
+```text
+LED 01-06: [  ] [  ] [  ] [P ] [2 ] [0 ]
+LED 07-12: [1 ] [1 ] [0.] [4 ] [5 ] [0 ]
+```
+
+Hàng 2 có DP tại cột 3 nên hệ số là `1`; kết quả
+`total_amount_vnd = 110450`.
+
+Ví dụ dưới 10 triệu:
+
+```text
+LED 07-12: [1.] [1 ] [0 ] [4.] [5 ] [0 ]
+```
+
+DP ở cột 1 và 4 nên `110450 * 10 = 1104500`.
+
+Ví dụ giá trị lớn dùng hệ số 10000:
+
+```text
+LED 07-12: [1 ] [1 ] [0 ] [4 ] [5 ] [0 ]
+LED 07-12: [1.] [1 ] [0 ] [4 ] [5 ] [0 ]
+```
+
+Cả mẫu không DP và mẫu chỉ có DP cột 1 đều được giải mã thành
+`110450 * 10000 = 1104500000`.
+
+#### Cách đọc tổng lít
+
+Implementation dùng `read_total_volume()`:
+
+1. Lưu generation hiện tại rồi gửi `C#44504ET`.
+2. Chờ `TOTALIZER_DISPLAY_SETTLE_MS=1000 ms` để màn hình ổn định.
+3. Poll snapshot mới mỗi 50 ms, tối đa 3000 ms.
+4. Giải mã toàn bộ chữ số hợp lệ ở hàng 1 thành phần nguyên.
+5. Ở hàng 2, DP đầu tiên là mốc bắt đầu phần thập phân. Các chữ số từ mốc
+   này được ghép theo thứ tự; nếu gặp DP thứ hai thì dừng.
+6. Tính `total_volume_l = integer_part + fractional_part/fractional_scale`.
+7. Gửi `C` để thoát màn hình tổng lít.
+
+Ví dụ:
+
+```text
+LED 01-06: [  ] [  ] [  ] [  ] [  ] [2 ]
+LED 07-12: [ .] [0 ] [  ] [  ] [ .] [7 ]
+```
+
+Hàng 1 cho phần nguyên `2`. DP đầu tiên mở vùng thập phân, chữ số `0` được
+lấy và DP thứ hai kết thúc vùng này. Kết quả là `total_volume_l = 2.0`.
+
+Nếu thiếu DP bắt đầu, không có chữ số thập phân, xuất hiện segment lạ, hoặc
+không có frame mới thì lần đọc thất bại. Mỗi phần retry tối đa 3 lần. Nếu một
+phần vẫn thất bại, `read_totalizer()` đặt cả hai output về `0` và không dùng
+dữ liệu cũ.
+
+#### Hiển thị Totalizer bằng phím tắt local
+
+Phím tắt ở slot 10 gọi `read_totalizer_result()` rồi hiển thị một trang 3x6:
+
+- hàng 1: copy nguyên 6 segment tổng tiền đã đọc, gồm cả vị trí DP;
+- hàng 2: phần thập phân của tổng lít nằm bên phải; một ô DP-only đặt ngay
+  trước các chữ số thập phân;
+- hàng 3: phần nguyên của tổng lít, canh phải trong 6 cột;
+- phần lít giữ tối đa 3 số thập phân, bỏ số `0` dư ở cuối nhưng luôn giữ ít
+  nhất một số sau dấu chấm.
+
+Nếu màn hình nguồn của tổng tiền là `[1.][1][0][4][5][0]`, hàng 1 của màn
+hình Totalizer giữ nguyên đúng pattern đó, không dựng lại từ số
+`total_amount_vnd`:
+
+```text
+LED 01-06: [1.] [1 ] [0 ] [4 ] [5 ] [0 ]
+```
+
+Nếu tổng lít là `266.5`, phần lẻ `.5` nằm ở góc phải hàng 2 và phần nguyên
+`266` nằm ở hàng 3:
+
+```text
+LED 07-12: [  ] [  ] [  ] [  ] [ .] [5 ]
+LED 13-18: [  ] [  ] [  ] [2 ] [6 ] [6 ]
+```
+
+Hàng tiền luôn có đúng 6 segment lấy từ decoder. Phần nguyên tổng lít tối đa
+6 chữ số; phần thập phân tối đa 5 chữ số do cần dành một cột cho DP-only.
+Firmware không cắt mất chữ số: nếu phần lít không vừa thì log lỗi và không bật
+màn hình Totalizer.
+
+Khi format hợp lệ, task gọi `control_display_led_begin_virtual()`, kéo IO39
+lên `1` để ESP32 chiếm quyền LED và quét cả ba hàng. Chế độ xem kết thúc khi
+người dùng nhấn bất kỳ phím vật lý nào hoặc bộ lọc giao dịch nhận được màn
+hình chuẩn bị bơm với hàng tiền bằng `0` và hàng lít bằng `0.00`/`0.000`.
+Phím thoát được tiêu thụ, không kích hoạt shortcut khác.
+
+`pump_transaction_filter` tăng `prepare_generation` tại đúng nhánh bắt đầu
+lượt bơm. Task Totalizer lưu generation lúc được kích hoạt và kiểm tra lại cả
+sau khi đọc tổng lẫn mỗi `TOTALIZER_VIEW_POLL_MS=50 ms` trong thời gian hiển
+thị. Nếu generation thay đổi trong lúc đang đọc, firmware không bật màn hình
+Totalizer. Nếu thay đổi khi đang hiển thị, firmware thoát và trả LED ngay.
+
+Khi thoát, IO39 về `0` và
+`control_display_led_end_virtual()` khôi phục buffer màn hình ngoài. Nếu trạng
+thái Wi-Fi đang cần LED thì quyền hiển thị được bàn giao cho luồng Wi-Fi.
 
 ### 6.5 `close_shift`
 
@@ -192,6 +324,31 @@ C#845443E -> verify P08 -> 0 -> verify hàng 2 = 0
 Mỗi phần retry 3 lần. ACK `totalizer_reset` chỉ khi cả hai thành công, reported bằng 0.
 
 ### 6.7 `set_shortcut_mapping`
+
+Slots 1-9 keep the normal `shortcut_key_N -> physical_key_N` behavior. Both
+fields are required and the matched physical shortcut emits the configured
+virtual-key sequence.
+
+Slot 10 is reserved for the local Totalizer view shortcut. Only
+`shortcut_key_10` is required:
+
+```json
+{
+  "param": {
+    "shortcut_key_10": "P9E"
+  }
+}
+```
+
+`physical_key_10` is optional for backward-compatible server payloads. Its
+value is persisted and returned in ACK readback, but is ignored at runtime and
+is never emitted as virtual keys. After NVS readback succeeds, entering `P9E` on the physical
+keypad starts the common `read_totalizer()` flow used by MQTT `get_totalizer`.
+It does not emit a virtual-key mapping and does not send an MQTT ACK. If slot
+10 has never been configured, the compatible default is `P88`. The configured
+value persists across reboot and OTA through the existing shortcut NVS blob.
+The successful ACK uses the same schema as slots 1-9 and reports both
+`mapping.shortcut_key`, `mapping.physical_key`, and the updated `revision`.
 
 Mỗi command cập nhật đúng một slot từ 1 đến 10:
 
@@ -230,11 +387,12 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 - `name`: shortcut hợp lệ, tối đa 16 ký tự.
 - `raw_command`: chỉ số, dài 1..6.
 - Gửi `C#122973E`, verify `P06`.
-- Chờ 1000 ms rồi nhập raw command.
+- Chờ `CALIBRATION_RAW_COMMAND_DELAY_MS=50 ms` rồi nhập raw command.
 - Verify hàng 2 đúng raw command.
 - Gửi `E`, verify hàng 1 `E0` và hàng 2 vẫn đúng.
 - Gửi `C` để thoát.
-- Retry tối đa 3 lần.
+- Command MQTT, boot reapply và mode restore retry tối đa 3 lần.
+- Calibration shortcut local chỉ thực hiện đúng 1 lần, không retry.
 - Chỉ sau verify thành công mới lưu mapping và `mode_calibration=name`.
 - ACK `calibration_command_applied`, reported gồm `name`, `command_echo`, `mode_calibration`.
 
@@ -250,7 +408,19 @@ bại sau 3 lần verify nội bộ, firmware tiếp tục lên lịch thử l�
 lặp cho tới khi về được mode cũ hoặc phát hiện thiết bị đã chuyển sang mode
 khác.
 
-Calibration shortcut local reuse chính hàm `execute_calibration_command()` và không phát MQTT ACK.
+Calibration shortcut local reuse cùng state machine và mutex với MQTT nhưng đặt
+`max_attempts=1`; nó không phát MQTT ACK. Trước khi phát phím, task chụp đủ
+snapshot LED 3 hàng x 6 cột. Sau khi calibration kết thúc, firmware chờ 500 ms,
+dùng snapshot này làm nền rồi ghi đè riêng hàng 3 cột 1:
+
+- thành công: chỉ sáng chân DP (`0x80`);
+- thất bại: hiển thị chữ `E` (`0x79`).
+
+Firmware bật IO39 và giữ màn hình kết quả trong 1 giây, sau đó kéo IO39 về 0 và
+trả buffer LED về dữ liệu màn hình thật. Nếu chưa từng có snapshot hợp lệ thì
+dùng nền trống nhưng vẫn hiển thị DP/E. Nếu Wi-Fi đang chiếm quyền LED thì không
+ghi đè; nếu trạng thái Wi-Fi xuất hiện trong thời gian hiển thị thì quyền LED
+được bàn giao cho luồng Wi-Fi.
 
 ### 6.9 `OTA`
 
@@ -286,6 +456,34 @@ Ví dụ manifest:
 
 Rollback được bật bằng `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. Firmware mới chờ 10 giây, kiểm tra core config NVS rồi gọi `esp_ota_mark_app_valid_cancel_rollback()`. Nếu self-test lỗi, firmware gọi rollback và reboot.
 
+### 6.10 `set_mqtt_config`
+
+```json
+{
+  "ts": 1791007000,
+  "version": "1.3",
+  "request_id": "cmd-mqtt-config-001",
+  "cmd": "set_mqtt_config",
+  "param": {
+    "mqtt_broker_host": "161.248.146.170",
+    "mqtt_broker_port": 1883,
+    "mqtt_username": "node_user",
+    "mqtt_password": "new_password"
+  }
+}
+```
+
+- Host không chứa scheme như `mqtt://`; port phải trong `1..65535`.
+- Password không được ghi ra log hoặc trả lại trong ACK.
+- Nếu cấu hình không đổi: ACK `ok/mqtt_config_unchanged`, không reboot.
+- Nếu có thay đổi: lưu candidate và cấu hình cũ vào
+  `device_cfg/mqtt_trial`, ACK `ok/mqtt_config_staged`, chờ 2 giây rồi reboot.
+- Sau reboot, MQTT dùng candidate. Khi connect và subscribe command thành công,
+  candidate được xác nhận và bản trial bị xóa.
+- Nếu broker không ready trong 60 giây hoặc từ chối xác thực, firmware phục hồi
+  cấu hình cũ và reboot.
+- ACK `reported` chỉ chứa host, port, username và `password_configured=true`.
+
 ## 7. Command khai báo nhưng chưa triển khai
 
 Các tên sau xuất hiện trong danh sách command nhưng chưa có handler:
@@ -300,15 +498,15 @@ Chúng hiện trả `result=rejected`, `description=unsupported_command`.
 
 Topic: `tbmq/keyboard/<node_id>/telemetry`.
 
-Field `version` cua moi telemetry lay tu app descriptor qua
-`firmware_version_get()`. Day cung la version OTA duoc sinh tu `PROJECT_VER`;
-khong con hard-code `1.3` trong telemetry. Version `1.3` chi con la schema cua
-command/ACK.
+Field `version` của mọi telemetry lấy từ app descriptor qua
+`firmware_version_get()`. Đây cũng là version OTA được sinh từ `PROJECT_VER`;
+không hard-code `1.3` trong telemetry. Version `1.3` chỉ là schema của
+command/ACK. `PROJECT_VER` hiện tại là `1.8`.
 
 ```json
 {
   "ts": 1789369621,
-  "version": "1.0.5",
+  "version": "1.8",
   "data": {
     "unit_price": 25000,
     "amount_vnd": 7850,
@@ -324,7 +522,7 @@ command/ACK.
 | Field | Kiểu | Đơn vị / quy tắc |
 |---|---|---|
 | `ts` | integer 64-bit | Unix UTC giây |
-| `version` | string | firmware `PROJECT_VER`, cung gia tri voi OTA app version |
+| `version` | string | firmware `PROJECT_VER`, cùng giá trị với OTA app version |
 | `unit_price` | number | VNĐ/L |
 | `amount_vnd` | number | VNĐ |
 | `volume_ml` | number | mL |
@@ -349,7 +547,7 @@ Nếu chưa đủ điều kiện mạng/time, lưu tối đa 32 giao dịch vào
 ```json
 {
   "ts": 1786523009,
-  "version": "1.0.5",
+  "version": "1.8",
   "data": {
     "total_amount_vnd": 125400000,
     "total_volume_l": 5016.2,
@@ -365,7 +563,7 @@ Chu kỳ 60 giây:
 ```json
 {
   "ts": 1786522928,
-  "version": "1.0.5",
+  "version": "1.8",
   "keep_alive": 1,
   "RSSI": -75,
   "data": {
@@ -374,7 +572,19 @@ Chu kỳ 60 giây:
 }
 ```
 
-Heartbeat bị bỏ qua nếu time chưa valid, RSSI lỗi, MQTT chưa ready hoặc chưa đọc được `unit_price` hợp lệ.
+Task heartbeat thử gửi ngay khi khởi động. Nếu MQTT chưa ready, task retry mỗi
+1 giây; sau lần publish thành công, chu kỳ tiếp theo là 60 giây.
+
+Heartbeat không bị bỏ chỉ vì SNTP, RSSI hoặc `unit_price` chưa sẵn sàng:
+
+- time chưa valid: gửi `ts=0`;
+- không đọc được RSSI hợp lệ: gửi `RSSI=0`;
+- chưa từng có đơn giá hợp lệ: gửi `data.unit_price=0`;
+- chỉ chưa publish được khi MQTT chưa ready, tạo JSON lỗi hoặc enqueue MQTT lỗi.
+
+Nguồn `unit_price` là cache RAM của `pump_transaction_filter`. Cache được seed
+từ NVS `device_cfg/last_price` khi boot, cập nhật khi giải mã được hàng 3 hợp lệ
+hoặc khi `set_unit_price` verify thành công. NVS chỉ được ghi khi giá thay đổi.
 
 ## 11. Wi-Fi Config Portal
 
@@ -403,9 +613,12 @@ SSID tối đa 32 byte; password tối đa 64 byte ở form. Credential cũ ch�
 | `device_cfg/core_cfg` | versioned blob | node ID + MQTT host/port/credential |
 | `device_cfg/hash_lock` | u8 | boolean |
 | `device_cfg/price_lock` | u8 | boolean |
+| `device_cfg/last_price` | u32 | đơn giá hợp lệ gần nhất, 1..999999 VNĐ/L |
 | `device_cfg/cal_mode` | string | 16 ký tự |
+| `device_cfg/cal_restore` | versioned blob | mode tạm và mode cần hoàn nguyên |
 | `device_cfg/shortcuts` | versioned blob | 10 slot + revision |
 | `device_cfg/calib_map` | versioned blob | 5 slot |
+| `device_cfg/mqtt_trial` | versioned blob | candidate + cấu hình MQTT cũ khi thử đổi broker |
 | `pump_tx/queue` | versioned blob | 32 giao dịch |
 
 Các blob có magic/version và một số luồng migration từ version cũ. `core_cfg` được seed từ `device_config.h` nếu chưa tồn tại hoặc không hợp lệ. MQTT không log password.
@@ -424,7 +637,8 @@ Quy trình xuất xưởng:
 2. Chạy `idf.py build`.
 3. Chạy `python tools/prepare_ota.py --branch <OTA_RELEASE_BRANCH>`.
 4. Kiểm tra version trong `OTA/version.json` trùng app version vừa build.
-5. Commit/push `OTA/file.bin` và `OTA/version.json` lên nhánh `main` cùng một lần.
+5. Commit/push `OTA/file.bin` và `OTA/version.json` lên đúng nhánh cấu hình bởi
+   `OTA_RELEASE_BRANCH` (hiện là `feature/control_kepad`) cùng một lần.
 6. Gửi command `OTA` và theo dõi log `OTA_MANAGER` qua lần reboot/self-test.
 
 Không dùng `git@github.com:...` trong firmware; ESP32 tải bằng HTTPS Raw GitHub.
@@ -432,7 +646,6 @@ Không dùng `git@github.com:...` trong firmware; ESP32 tải bằng HTTPS Raw G
 ## 15. Điểm mở rộng khuyến nghị
 
 - Bổ sung chữ ký firmware/Secure Boot để chống image bị thay thế nếu tài khoản GitHub bị xâm nhập.
-- Gửi ACK kết quả cuối cho `set_unit_price`, thay vì chỉ ACK accepted.
 - Persist dedup request nếu backend cần idempotency qua reboot.
 - Lưu timestamp gốc cho buffered transaction.
 - Chuyển MQTT TCP sang TLS và đưa secret ra khỏi source.

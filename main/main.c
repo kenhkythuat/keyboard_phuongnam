@@ -19,6 +19,7 @@
 #include "device_settings.h"
 #include "control_display_led.h"
 #include "pump_data_sniffer.h"
+#include "pump_transaction_filter.h"
 #include "mqtt_command_handler.h"
 #include "mqtt_manager.h"
 #include "ota_manager.h"
@@ -45,11 +46,20 @@ static const char *TAG = "KEY_OUTPUT";
 #define SHORTCUT_OUTPUT_INTERVAL_MS    500U
 #define SHORTCUT_INPUT_TIMEOUT_MS      2000U
 #define SHORTCUT_OUTPUT_QUEUE_LENGTH   4U
+#define LOCAL_CALIBRATION_LED_DELAY_MS 500U
+#define LOCAL_CALIBRATION_LED_TIME_MS  1000U
 #define TOTALIZER_VIEW_POLL_MS         50U
 #define TOTALIZER_VIEW_TASK_STACK_SIZE 4096U
 #define TOTALIZER_VIEW_MAX_SEGMENTS    CONTROL_DISPLAY_COLUMNS
 #define WIFI_CONFIG_LED_POLL_MS        50U
 #define WIFI_CONFIG_LED_TASK_STACK_SIZE 3072U
+
+_Static_assert(PUMP_DATA_DISPLAY_ROWS == CONTROL_DISPLAY_ROWS,
+               "Sniffer and virtual LED row counts must match");
+_Static_assert(PUMP_DATA_DISPLAY_COLUMNS == CONTROL_DISPLAY_COLUMNS,
+               "Sniffer and virtual LED column counts must match");
+_Static_assert(TOTALIZER_LED_COLUMNS == CONTROL_DISPLAY_COLUMNS,
+               "Totalizer snapshot and virtual LED columns must match");
 
 #define PIN_D0          GPIO_NUM_16
 #define PIN_D1          GPIO_NUM_8
@@ -115,7 +125,11 @@ static bool s_virtual_output_active;
 static TaskHandle_t s_totalizer_view_task_handle;
 static bool s_totalizer_view_active;
 static bool s_totalizer_view_exit_requested;
+static uint32_t s_totalizer_view_prepare_generation;
+static bool s_local_calibration_led_active;
 static wifi_status_led_view_t s_wifi_status_led_view;
+
+static bool wifi_status_led_is_requested(void);
 
 static void virtual_led_enable_init(void)
 {
@@ -577,18 +591,21 @@ static bool keypad_find_shortcut(uint8_t key_code,
     input[input_length++] = character;
     input[input_length] = '\0';
 
-    if (input_length >= 3U &&
-        strcmp(input + input_length - 3U, "P88") == 0) {
+    bool totalizer_prefix = false;
+    if (device_settings_match_totalizer_shortcut(input,
+                                                 &totalizer_prefix)) {
+        char totalizer_shortcut[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+        (void)device_settings_get_totalizer_shortcut(
+            totalizer_shortcut, sizeof(totalizer_shortcut), NULL);
         input_length = 0U;
         input[0] = '\0';
         *totalizer_view_requested = true;
-        ESP_LOGI(TAG, "Da decode du chuoi vat ly P88");
+        ESP_LOGI(TAG, "Da decode shortcut Totalizer vat ly %s",
+                 totalizer_shortcut);
         return false;
     }
 
-    if (input[input_length - 1U] == 'P' ||
-        (input_length >= 2U &&
-         strcmp(input + input_length - 2U, "P8") == 0)) {
+    if (totalizer_prefix) {
         return false;
     }
 
@@ -654,6 +671,68 @@ static bool calibration_output_queue(
     return true;
 }
 
+static esp_err_t show_local_calibration_result(
+    const uint8_t saved_display[CONTROL_DISPLAY_ROWS]
+                               [CONTROL_DISPLAY_COLUMNS],
+    bool saved_display_valid,
+    bool calibration_succeeded)
+{
+    uint8_t result_display[CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS] = {0};
+    if (saved_display_valid && saved_display != NULL) {
+        memcpy(result_display, saved_display, sizeof(result_display));
+    } else {
+        ESP_LOGW(TAG, "Khong co snapshot LED truoc calibration, dung nen trong");
+    }
+
+    /* Success: DP only. Failure: letter E. */
+    result_display[2][0] = calibration_succeeded ? 0x80U : 0x79U;
+
+    __atomic_store_n(&s_local_calibration_led_active, true,
+                     __ATOMIC_RELEASE);
+    vTaskDelay(pdMS_TO_TICKS(LOCAL_CALIBRATION_LED_DELAY_MS));
+
+    if (wifi_status_led_is_requested() ||
+        __atomic_load_n(&s_totalizer_view_active, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s_local_calibration_led_active, false,
+                         __ATOMIC_RELEASE);
+        ESP_LOGW(TAG,
+                 "Bo hien thi ket qua calibration vi LED dang duoc chuc nang "
+                 "khac su dung");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = control_display_led_begin_virtual(result_display);
+    if (err == ESP_OK) {
+        err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 1);
+    }
+    if (err != ESP_OK) {
+        control_display_led_end_virtual();
+        __atomic_store_n(&s_local_calibration_led_active, false,
+                         __ATOMIC_RELEASE);
+        return err;
+    }
+
+    ESP_LOGI(TAG,
+             "Calibration local %s: mo phong snapshot, ROW_3 COL_1=%s",
+             calibration_succeeded ? "OK" : "FAIL",
+             calibration_succeeded ? "DP" : "E");
+    vTaskDelay(pdMS_TO_TICKS(LOCAL_CALIBRATION_LED_TIME_MS));
+
+    if (wifi_status_led_is_requested()) {
+        ESP_LOGI(TAG, "Ban giao quyen LED tu calibration sang trang thai Wi-Fi");
+    } else {
+        err = gpio_set_level(ENABLE_VIRTUAL_LED_GPIO, 0);
+        control_display_led_end_virtual();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Ket thuc bao calibration, IO39=0");
+        }
+    }
+
+    __atomic_store_n(&s_local_calibration_led_active, false,
+                     __ATOMIC_RELEASE);
+    return err;
+}
+
 static void shortcut_output_task(void *argument)
 {
     (void)argument;
@@ -663,7 +742,21 @@ static void shortcut_output_task(void *argument)
         if (xQueueReceive(s_shortcut_output_queue, &message,
                           portMAX_DELAY) == pdTRUE) {
             esp_err_t err;
+            uint8_t saved_display[CONTROL_DISPLAY_ROWS]
+                                 [CONTROL_DISPLAY_COLUMNS] = {0};
+            bool saved_display_valid = false;
             if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
+                uint32_t saved_generation = 0U;
+                saved_display_valid = mbi_sniffer_get_display_snapshot(
+                    saved_display, &saved_generation);
+                if (saved_display_valid) {
+                    ESP_LOGI(TAG,
+                             "Da luu snapshot LED truoc calibration, generation=%u",
+                             (unsigned)saved_generation);
+                } else {
+                    ESP_LOGW(TAG,
+                             "Chua co snapshot LED hop le truoc calibration");
+                }
                 ESP_LOGI(TAG, "Bat dau calibration local: %s",
                          message.sequence);
                 err = mqtt_command_handler_execute_local_calibration(
@@ -673,12 +766,26 @@ static void shortcut_output_task(void *argument)
                 err = virtual_key_output_run_sequence(
                     message.sequence, SHORTCUT_OUTPUT_INTERVAL_MS);
             }
-            if (err != ESP_OK) {
+            if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
+                bool calibration_succeeded = err == ESP_OK;
+                if (calibration_succeeded) {
+                    ESP_LOGI(TAG, "Calibration local hoan tat: %s",
+                             message.sequence);
+                } else {
+                    ESP_LOGE(TAG, "Calibration local that bai: %s",
+                             esp_err_to_name(err));
+                }
+                esp_err_t display_err = show_local_calibration_result(
+                    saved_display, saved_display_valid,
+                    calibration_succeeded);
+                if (display_err != ESP_OK &&
+                    display_err != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGE(TAG, "Khong hien thi duoc bao calibration: %s",
+                             esp_err_to_name(display_err));
+                }
+            } else if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Xu ly shortcut that bai: %s",
                          esp_err_to_name(err));
-            } else if (message.type == SHORTCUT_OUTPUT_CALIBRATION) {
-                ESP_LOGI(TAG, "Calibration local hoan tat: %s",
-                         message.sequence);
             }
         }
     }
@@ -735,49 +842,30 @@ static bool numeric_text_to_segments(const char *text,
     return true;
 }
 
-static bool format_amount_vnd(uint64_t amount_vnd, char *output,
-                              size_t output_size)
-{
-    char digits[32];
-    int digit_count = snprintf(digits, sizeof(digits), "%" PRIu64, amount_vnd);
-    if (digit_count <= 0 || (size_t)digit_count >= sizeof(digits)) {
-        return false;
-    }
-
-    size_t separator_count = ((size_t)digit_count - 1U) / 3U;
-    if ((size_t)digit_count + separator_count + 1U > output_size) {
-        return false;
-    }
-
-    size_t output_index = 0U;
-    for (size_t index = 0U; index < (size_t)digit_count; index++) {
-        output[output_index++] = digits[index];
-        size_t remaining_digits = (size_t)digit_count - index - 1U;
-        if (remaining_digits > 0U && (remaining_digits % 3U) == 0U) {
-            output[output_index++] = '.';
-        }
-    }
-    output[output_index] = '\0';
-    return true;
-}
-
 static bool render_totalizer_display(
-    const uint8_t *amount_segments,
-    size_t amount_count,
-    const uint8_t *volume_segments,
-    size_t volume_count,
+    const uint8_t amount_segments[TOTALIZER_LED_COLUMNS],
+    const uint8_t *volume_integer_segments,
+    size_t volume_integer_count,
+    const uint8_t *volume_fraction_segments,
+    size_t volume_fraction_count,
     uint8_t output[CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS])
 {
-    if (amount_count > CONTROL_DISPLAY_COLUMNS ||
-        volume_count > CONTROL_DISPLAY_COLUMNS) {
+    if (volume_integer_count > CONTROL_DISPLAY_COLUMNS ||
+        volume_fraction_count == 0U ||
+        volume_fraction_count + 1U > CONTROL_DISPLAY_COLUMNS) {
         return false;
     }
 
     memset(output, 0, CONTROL_DISPLAY_ROWS * CONTROL_DISPLAY_COLUMNS);
-    memcpy(&output[0][CONTROL_DISPLAY_COLUMNS - amount_count],
-           amount_segments, amount_count);
-    memcpy(&output[2][CONTROL_DISPLAY_COLUMNS - volume_count],
-           volume_segments, volume_count);
+    memcpy(output[0], amount_segments, CONTROL_DISPLAY_COLUMNS);
+
+    size_t fraction_start = CONTROL_DISPLAY_COLUMNS - volume_fraction_count;
+    output[1][fraction_start - 1U] = 0x80U;
+    memcpy(&output[1][fraction_start], volume_fraction_segments,
+           volume_fraction_count);
+
+    memcpy(&output[2][CONTROL_DISPLAY_COLUMNS - volume_integer_count],
+           volume_integer_segments, volume_integer_count);
     return true;
 }
 
@@ -791,15 +879,21 @@ static bool wifi_status_led_is_requested(void)
 
 static bool totalizer_view_trigger(void)
 {
+    uint32_t prepare_generation =
+        pump_transaction_filter_get_prepare_generation();
     bool expected = false;
     if (s_totalizer_view_task_handle == NULL ||
         wifi_status_led_is_requested() ||
+        __atomic_load_n(&s_local_calibration_led_active,
+                        __ATOMIC_ACQUIRE) ||
         !__atomic_compare_exchange_n(&s_totalizer_view_active, &expected, true,
                                      false, __ATOMIC_ACQ_REL,
                                      __ATOMIC_ACQUIRE)) {
         return false;
     }
 
+    __atomic_store_n(&s_totalizer_view_prepare_generation,
+                     prepare_generation, __ATOMIC_RELEASE);
     __atomic_store_n(&s_totalizer_view_exit_requested, false,
                      __ATOMIC_RELEASE);
     xTaskNotifyGive(s_totalizer_view_task_handle);
@@ -819,12 +913,21 @@ static void totalizer_view_task(void *argument)
     while (1) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        uint64_t total_amount_vnd = 0U;
-        double total_volume_l = 0.0;
-        esp_err_t err = read_totalizer(&total_amount_vnd, &total_volume_l);
+        uint32_t prepare_generation = __atomic_load_n(
+            &s_totalizer_view_prepare_generation, __ATOMIC_ACQUIRE);
+        totalizer_result_t totalizer = {0};
+        esp_err_t err = read_totalizer_result(&totalizer);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "P88 doc Totalizer that bai: %s",
+            ESP_LOGE(TAG, "Shortcut Totalizer doc that bai: %s",
                      esp_err_to_name(err));
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+        if (pump_transaction_filter_get_prepare_generation() !=
+            prepare_generation) {
+            ESP_LOGI(TAG,
+                     "Man hinh ve 0/0.00, huy hien thi Totalizer de bat dau bom");
             __atomic_store_n(&s_totalizer_view_active, false,
                              __ATOMIC_RELEASE);
             continue;
@@ -836,15 +939,13 @@ static void totalizer_view_task(void *argument)
             continue;
         }
 
-        char amount_text[32];
         char volume_text[32];
         int volume_length = snprintf(volume_text, sizeof(volume_text),
-                                     "%.3f", total_volume_l);
-        if (!format_amount_vnd(total_amount_vnd, amount_text,
-                               sizeof(amount_text)) ||
-            volume_length <= 0 || (size_t)volume_length >= sizeof(volume_text) ||
-            !isfinite(total_volume_l)) {
-            ESP_LOGE(TAG, "P88 khong format duoc du lieu Totalizer");
+                                     "%.3f", totalizer.total_volume_l);
+        if (volume_length <= 0 ||
+            (size_t)volume_length >= sizeof(volume_text) ||
+            !isfinite(totalizer.total_volume_l)) {
+            ESP_LOGE(TAG, "Shortcut Totalizer khong format duoc du lieu");
             __atomic_store_n(&s_totalizer_view_active, false,
                              __ATOMIC_RELEASE);
             continue;
@@ -856,25 +957,39 @@ static void totalizer_view_task(void *argument)
             *end-- = '\0';
         }
 
-        uint8_t amount_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
-        uint8_t volume_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
-        size_t amount_count = 0U;
-        size_t volume_count = 0U;
-        if (!numeric_text_to_segments(amount_text, amount_segments,
-                                      &amount_count) ||
-            !numeric_text_to_segments(volume_text, volume_segments,
-                                      &volume_count)) {
-            ESP_LOGE(TAG, "P88 du lieu Totalizer vuot kha nang hien thi");
+        if (decimal == NULL || decimal[1] == '\0') {
+            ESP_LOGE(TAG, "Tong lit khong co phan thap phan");
+            __atomic_store_n(&s_totalizer_view_active, false,
+                             __ATOMIC_RELEASE);
+            continue;
+        }
+        *decimal = '\0';
+        const char *fraction_text = decimal + 1U;
+
+        uint8_t volume_integer_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
+        uint8_t volume_fraction_segments[TOTALIZER_VIEW_MAX_SEGMENTS];
+        size_t volume_integer_count = 0U;
+        size_t volume_fraction_count = 0U;
+        if (!numeric_text_to_segments(volume_text,
+                                      volume_integer_segments,
+                                      &volume_integer_count) ||
+            !numeric_text_to_segments(fraction_text,
+                                      volume_fraction_segments,
+                                      &volume_fraction_count)) {
+            ESP_LOGE(TAG, "Du lieu Totalizer vuot kha nang hien thi");
             __atomic_store_n(&s_totalizer_view_active, false,
                              __ATOMIC_RELEASE);
             continue;
         }
 
         uint8_t display[CONTROL_DISPLAY_ROWS][CONTROL_DISPLAY_COLUMNS];
-        if (!render_totalizer_display(amount_segments, amount_count,
-                                      volume_segments, volume_count,
+        if (!render_totalizer_display(totalizer.amount_segments,
+                                      volume_integer_segments,
+                                      volume_integer_count,
+                                      volume_fraction_segments,
+                                      volume_fraction_count,
                                       display)) {
-            ESP_LOGE(TAG, "P88 moi gia tri chi duoc toi da %u LED",
+            ESP_LOGE(TAG, "Totalizer moi gia tri chi duoc toi da %u LED",
                      (unsigned)CONTROL_DISPLAY_COLUMNS);
             __atomic_store_n(&s_totalizer_view_active, false,
                              __ATOMIC_RELEASE);
@@ -904,12 +1019,19 @@ static void totalizer_view_task(void *argument)
                              __ATOMIC_RELEASE);
             continue;
         }
-        ESP_LOGI(TAG, "P88 hien thi Totalizer: amount=%" PRIu64
+        ESP_LOGI(TAG, "Shortcut hien thi Totalizer: amount=%" PRIu64
                       " volume=%.3f, IO39=1",
-                 total_amount_vnd, total_volume_l);
+                 totalizer.total_amount_vnd, totalizer.total_volume_l);
 
+        bool exited_for_pump_prepare = false;
         while (!__atomic_load_n(&s_totalizer_view_exit_requested,
                                 __ATOMIC_ACQUIRE)) {
+            if (pump_transaction_filter_get_prepare_generation() !=
+                prepare_generation) {
+                exited_for_pump_prepare = true;
+                totalizer_view_request_exit();
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(TOTALIZER_VIEW_POLL_MS));
         }
 
@@ -927,9 +1049,12 @@ static void totalizer_view_task(void *argument)
         __atomic_store_n(&s_totalizer_view_active, false,
                          __ATOMIC_RELEASE);
         if (wifi_status_requested) {
-            ESP_LOGI(TAG, "Thoat P88, giu quyen LED cho trang thai Wi-Fi");
+            ESP_LOGI(TAG, "Thoat Totalizer, giu quyen LED cho trang thai Wi-Fi");
+        } else if (exited_for_pump_prepare) {
+            ESP_LOGI(TAG,
+                     "Thoat Totalizer do man hinh ve 0/0.00, IO39=0");
         } else {
-            ESP_LOGI(TAG, "Thoat P88, IO39=0, tra man hinh ve mach ngoai");
+            ESP_LOGI(TAG, "Thoat Totalizer, IO39=0, tra man hinh ve mach ngoai");
         }
     }
 }
@@ -1150,7 +1275,7 @@ static void keypad_scan_task(void *argument)
                 calibration_pending = false;
                 totalizer_view_pending = false;
                 if (physical_key != KEY_NONE) {
-                    ESP_LOGI(TAG, "Nhan phim %s, yeu cau thoat P88",
+                    ESP_LOGI(TAG, "Nhan phim %s, yeu cau thoat Totalizer",
                              key_get_name(physical_key));
                     totalizer_view_request_exit();
                 }
@@ -1163,7 +1288,7 @@ static void keypad_scan_task(void *argument)
                         &totalizer_view_pending);
                 } else if (totalizer_view_pending) {
                     if (!totalizer_view_trigger()) {
-                        ESP_LOGW(TAG, "Khong the bat che do xem P88");
+                        ESP_LOGW(TAG, "Khong the bat che do xem Totalizer");
                     }
                     totalizer_view_pending = false;
                     calibration_pending = false;

@@ -1,5 +1,36 @@
 # Error Handling and Edge Cases
 
+## Giải mã và hiển thị Totalizer
+
+| Điều kiện | Xử lý hiện tại |
+|---|---|
+| Hàng 1 không có `P20` khi đọc tổng tiền | Bỏ frame, chờ frame mới; hết 3 giây thì retry |
+| Hàng số tổng tiền có segment khác blank/0-9 | Bỏ toàn bộ frame, không ghép dữ liệu một phần |
+| DP tổng tiền chỉ ở cột 3 | Ghép 6 chữ số với hệ số `1` |
+| DP tổng tiền ở cột 1 và 4 | Ghép 6 chữ số với hệ số `10` |
+| Tổng tiền không DP hoặc chỉ DP cột 1 | Ghép 6 chữ số với hệ số `10000` |
+| DP tổng tiền có pattern khác | Bỏ frame và retry để tránh sai hệ số |
+| Tổng lít thiếu DP bắt đầu hoặc thiếu chữ số thập phân | Bỏ frame và retry, không suy đoán giá trị |
+| Tổng lít có DP thứ hai | Dùng DP thứ hai làm điểm kết thúc vùng thập phân |
+| Snapshot có generation cũ | Bỏ qua để tránh lấy màn hình trước khi gửi phím |
+| Một trong hai phần thất bại sau 3 lần | Đặt cả tiền và lít về 0; không hiển thị/publish dữ liệu cũ |
+| Phần nguyên lít cần hơn 6 LED hoặc phần lẻ không còn chỗ cho DP | Không cắt chữ số, không bật Virtual LED và log lỗi |
+| Người dùng yêu cầu thoát trong lúc đang đọc | Không bật IO39 sau khi đọc xong; kết thúc an toàn |
+| Wi-Fi config/status đang giữ LED | Không bắt đầu Totalizer local; giữ quyền LED cho Wi-Fi |
+| Nhấn phím khi đang xem Totalizer | Tiêu thụ phím, thoát, IO39 về 0; không chạy command khác |
+| LED decode nhận màn hình chuẩn bị bơm `0 / 0.00` hoặc `0 / 0.000` | Tăng `prepare_generation`; Totalizer tự thoát, IO39 về 0 và trả LED cho mạch ngoài |
+| Màn hình chuẩn bị bơm xuất hiện trong lúc đang đọc tổng | Sau khi đọc xong thấy generation đã đổi; không bật Virtual LED bằng dữ liệu Totalizer vừa đọc |
+
+## Totalizer Shortcut Slot 10
+
+| Condition | Detection | Handling | State impact |
+|---|---|---|---|
+| Slot 10 is absent from NVS | Read returns `ESP_ERR_NOT_FOUND` | Use compatible default `P88` | No NVS write and no error ACK |
+| Payload omits `physical_key_10` | Valid `shortcut_key_10` is the only field | Persist, read back, then ACK `ok` | Totalizer shortcut changes |
+| Payload includes `physical_key_10` | Optional valid string is present | Persist and return it in ACK, but ignore it at runtime | It is never emitted as virtual keys |
+| Shortcut is incomplete | Input is only a prefix of slot 10 | Wait for completion or keypad timeout | Totalizer does not start |
+| Shortcut conflicts with another stored slot | Duplicate check fails | ACK `error/invalid_param` | Existing mapping remains unchanged |
+
 ## 1. MQTT và command
 
 | Điều kiện | Phát hiện | Xử lý hiện tại | ACK/log | Ảnh hưởng trạng thái |
@@ -55,10 +86,14 @@ Giao dịch invalid do công thức hiện không được retry và không gử
 | Không thấy `P20`, `P08`, `P06` hoặc `E0` | Thoát bằng `C` và retry |
 | Tổng tiền/tổng lít decode lỗi | Retry tối đa 3 lần |
 | Một phần totalizer thất bại | Trả cả hai giá trị về 0, không publish telemetry hợp lệ |
-| Raw calibration không khớp | Retry toàn bộ calibration tối đa 3 lần |
-| Calibration thất bại | Không ghi mapping/mode mới |
-| P88 đọc thất bại | Không hiển thị dữ liệu cũ; thoát trạng thái active |
-| Giá trị P88 vượt 6 LED mỗi hàng | Log lỗi và không cắt chữ số |
+| Raw calibration MQTT/boot/restore không khớp | Retry toàn bộ calibration tối đa 3 lần |
+| Calibration shortcut local không khớp | Chỉ chạy 1 lần, gửi `C` để thoát và không retry |
+| Calibration local thất bại | Không ghi mode mới; sau 500 ms mô phỏng snapshot cũ và hiển thị `E` tại hàng 3 cột 1 |
+| Calibration local thành công | Sau 500 ms mô phỏng snapshot cũ và chỉ sáng DP tại hàng 3 cột 1 |
+| Chưa có snapshot LED trước calibration local | Dùng nền trống, vẫn hiển thị DP hoặc `E` |
+| Wi-Fi/Totalizer đang giữ LED | Không ghi đè luồng đang giữ LED; kết quả calibration không bị thay đổi |
+| Shortcut Totalizer đọc thất bại | Không hiển thị dữ liệu cũ; thoát trạng thái active |
+| Giá trị Totalizer vượt 6 LED mỗi hàng | Log lỗi và không cắt chữ số |
 
 `s_totalizer_mutex` ngăn get/reset/calibration chạy đồng thời.
 
@@ -72,6 +107,9 @@ Giao dịch invalid do công thức hiện không được retry và không gử
 | Mapping trùng shortcut ở slot khác | `ESP_ERR_INVALID_ARG`, ACK `invalid_param` |
 | Ghi mapping xong readback sai | ACK `reported_mismatch` hoặc `verification_failed` |
 | Mode calibration chưa lưu | Dùng mặc định `P1E` |
+| `last_price` chưa tồn tại sau nâng cấp firmware | Trạng thái lần đầu hợp lệ; dùng `unit_price=0` cho tới khi LED hoặc `set_unit_price` cung cấp giá |
+| `last_price` bằng 0 hoặc lớn hơn 999999 | Xóa cache sai, tiếp tục chạy và chờ giá hợp lệ |
+| Giá mới trùng giá NVS | Không commit Flash lại |
 | `core_cfg` chưa tồn tại | Seed từ `device_config.h`, commit và readback |
 | `core_cfg` sai magic/version/length | Khôi phục factory seed và log cảnh báo |
 | Ghi/readback core config lỗi | Giữ cấu hình RAM cũ, trả lỗi storage/verification |
@@ -94,7 +132,18 @@ Cảnh báo: nhánh erase NVS khi init lỗi sẽ xóa Wi-Fi, settings và pendi
 
 Password không được ghi ra log. AP password vẫn đang nằm trong firmware config và cần đổi trước production.
 
-## 7. Time
+## 7. Heartbeat
+
+| Điều kiện | Xử lý |
+|---|---|
+| Task vừa khởi động, MQTT chưa ready | Retry mỗi 1 giây; gửi ngay khi MQTT ready, không chờ đủ 60 giây đầu |
+| SNTP chưa sync | Vẫn publish với `ts=0` |
+| RSSI chưa đọc được/ngoài miền hợp lệ | Vẫn publish với `RSSI=0` |
+| Chưa có giá từ LED và NVS chưa có `last_price` | Vẫn publish với `data.unit_price=0` |
+| MQTT enqueue thất bại | Log cảnh báo và retry sau 1 giây |
+| Publish thành công | Chờ 60 giây trước heartbeat tiếp theo |
+
+## 8. Time
 
 | Điều kiện | Xử lý |
 |---|---|
@@ -103,7 +152,7 @@ Password không được ghi ra log. AP password vẫn đang nằm trong firmwar
 | Có IP lại | Yêu cầu sync lại |
 | SNTP start lỗi | Log cảnh báo, không reset |
 
-## 8. Bảo mật và production
+## 9. Bảo mật và production
 
 Hiện trạng cần xử lý trước khi triển khai production:
 
@@ -114,7 +163,7 @@ Hiện trạng cần xử lý trước khi triển khai production:
 - Bootloader rollback đã bật, nhưng Secure Boot/chữ ký ứng dụng chưa bật.
 - Web Portal chỉ phù hợp mạng cấu hình cục bộ, chưa có CSRF/session authentication.
 
-## 9. Log chẩn đoán theo module
+## 10. Log chẩn đoán theo module
 
 | TAG | Nội dung cần xem |
 |---|---|
@@ -125,8 +174,8 @@ Hiện trạng cần xử lý trước khi triển khai production:
 | `MQTT_COMMAND` | Param, retry, verification và ACK |
 | `WIFI_MANAGER` | STA/AP, reconnect, credential trial |
 | `TIME_MANAGER` | SNTP request và sync |
-| `TELEMETRY_HEARTBEAT` | Điều kiện heartbeat hoặc lý do bỏ qua |
-| `KEY_OUTPUT` | Keypad, virtual key, shortcut, P88 và IO39 |
+| `TELEMETRY_HEARTBEAT` | Payload đã queue hoặc lỗi queue/retry heartbeat |
+| `KEY_OUTPUT` | Keypad, virtual key, shortcut Totalizer và IO39 |
 | `OTA_MANAGER` | Manifest, version, download, self-test và rollback |
 
 ### OTA errors
@@ -143,7 +192,7 @@ Hiện trạng cần xử lý trước khi triển khai production:
 | Firmware mới crash trước self-test | Bootloader rollback app cũ |
 | Self-test đọc core NVS lỗi | Mark invalid và rollback |
 
-## 10. Test regression tối thiểu
+## 11. Test regression tối thiểu
 
 1. Boot khi màn hình đang có giao dịch cũ: không gửi telemetry.
 2. `0/0` -> một mẫu kết quả -> đứng 10 giây: gửi đúng một giao dịch.
@@ -154,7 +203,11 @@ Hiện trạng cần xử lý trước khi triển khai production:
 7. Mất router và có lại: Wi-Fi, SNTP, MQTT tự phục hồi.
 8. Sai password portal: credential cũ không bị mất.
 9. Mỗi command dùng frame LED mới, không xác nhận bằng frame cũ.
-10. P88 thoát bằng bất kỳ phím và IO39 trở về 0.
+10. Totalizer local thoát bằng bất kỳ phím và IO39 trở về 0.
 11. OTA cùng version: ACK accepted, không tải/không reboot.
 12. OTA version mới: tải, reboot, self-test và mark-valid.
 13. Ngắt nguồn trước mark-valid: bootloader rollback firmware cũ.
+14. Nâng cấp từ firmware chưa có `last_price`: boot bình thường, heartbeat gửi giá 0 cho tới khi có giá hợp lệ.
+15. Sau khi lưu giá hợp lệ, reboot khi màn hình chưa đổi: heartbeat dùng lại giá từ NVS.
+16. Heartbeat khi chưa sync time hoặc chưa đọc được RSSI: vẫn gửi với giá trị fallback 0.
+17. `set_mqtt_config` sai credential: rollback về broker cũ và không lặp reboot vô hạn.

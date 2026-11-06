@@ -7,6 +7,8 @@
 #include "esp_err.h"
 
 #define SHORTCUT_MAPPING_MAX_COUNT          10U
+#define TOTALIZER_SHORTCUT_SLOT             10U
+#define DEFAULT_TOTALIZER_SHORTCUT          "P88"
 #define SHORTCUT_KEY_MAX_LENGTH             16U
 #define SHORTCUT_PHYSICAL_KEY_MAX_LENGTH    32U
 #define CALIBRATION_MAPPING_MAX_COUNT       5U
@@ -76,6 +78,14 @@ esp_err_t device_settings_get_shortcut_mapping_at(
     uint32_t *revision);
 bool device_settings_find_shortcut_suffix(const char *input,
                                           shortcut_mapping_t *mapping);
+esp_err_t device_settings_set_totalizer_shortcut(const char *shortcut_key,
+                                                 const char *physical_key,
+                                                 uint32_t *revision);
+esp_err_t device_settings_get_totalizer_shortcut(char *shortcut_key,
+                                                 size_t size,
+                                                 uint32_t *revision);
+bool device_settings_match_totalizer_shortcut(const char *input,
+                                              bool *is_prefix);
 bool device_settings_calibration_mapping_is_valid(const char *name,
                                                    const char *raw_command);
 esp_err_t device_settings_set_calibration_mapping_at(

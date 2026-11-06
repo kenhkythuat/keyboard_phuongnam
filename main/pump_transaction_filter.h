@@ -11,6 +11,7 @@
 esp_err_t pump_transaction_filter_start(void);
 esp_err_t pump_transaction_filter_get_unit_price(uint32_t *unit_price);
 esp_err_t pump_transaction_filter_update_unit_price(uint32_t unit_price);
+uint32_t pump_transaction_filter_get_prepare_generation(void);
 
 bool pump_transaction_filter_submit(
     const uint8_t display[PUMP_TRANSACTION_DISPLAY_ROWS]

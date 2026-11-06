@@ -20,6 +20,7 @@ sequenceDiagram
     else core_cfg hợp lệ
         Settings->>Settings: load node/MQTT config + command settings
     end
+    Settings->>Settings: load last_price; missing is not a boot error
     Boot->>Key: start sniffer + init virtual key GPIO
     Boot->>Calibration: load cal_mode và mapping từ NVS
     Calibration->>Key: áp dụng lại raw_command, verify tối đa 3 lần
@@ -29,7 +30,7 @@ sequenceDiagram
     WiFi-->>Boot: return ngay
     Boot->>Time: start SNTP manager
     Boot->>MQTT: init client bằng core_cfg từ NVS
-    Boot->>App: start heartbeat/P88/status LED/keypad scan
+    Boot->>App: start heartbeat/Totalizer view/status LED/keypad scan
     WiFi-->>Time: IP_EVENT_STA_GOT_IP
     Time->>Time: start/restart SNTP
     WiFi-->>MQTT: IP_EVENT_STA_GOT_IP
@@ -146,7 +147,7 @@ Command callback không chạy chuỗi phím. Công việc dài nằm trong comm
 
 ```mermaid
 flowchart TD
-    A[get_totalizer or P88] --> B[Lock totalizer mutex]
+    A[get_totalizer or configured slot-10 shortcut] --> B[Lock totalizer mutex]
     B --> C[Send C#7733]
     C --> D[Capture baseline generation]
     D --> E[Send E]
@@ -162,10 +163,77 @@ flowchart TD
     L --> M[Send C and unlock]
     M --> N{Source?}
     N -- MQTT --> O[ACK + totalizer telemetry]
-    N -- P88 --> P[IO39=1, amount row 1, volume row 3]
+    N -- Local shortcut --> P[IO39=1, amount row 1, volume row 3]
 ```
 
-Trong P88, bất kỳ phím vật lý nào yêu cầu thoát; firmware trả IO39 về 0 và không dùng phím thoát để kích hoạt command khác.
+### 6.1 Ghép dữ liệu tổng tiền
+
+```mermaid
+flowchart TD
+    A[Fresh 3x6 snapshot] --> B{Row 1 columns 4-6 = P20?}
+    B -- No --> X[Reject frame]
+    B -- Yes --> C[Scan row 2 left to right]
+    C --> D{Blank or digit 0-9?}
+    D -- Unknown segment --> X
+    D -- Blank --> C
+    D -- Digit --> E[value = value * 10 + digit]
+    E --> C
+    C -->|End row| F[Build six displayed digits]
+    F --> G[Read DP mask]
+    G --> H[Apply multiplier 1, 10 or 10000]
+    H --> I[total_amount_vnd uint64]
+```
+
+DP không thay đổi bản thân chữ số nhưng quyết định hệ số: cột 3 = `x1`, cột
+1+4 = `x10`, không DP hoặc chỉ cột 1 = `x10000`. Sáu segment gốc được giữ lại
+cho chế độ hiển thị local.
+
+### 6.2 Ghép dữ liệu tổng lít
+
+```mermaid
+flowchart TD
+    A[Fresh volume snapshot] --> B[Decode row 1 as integer_part]
+    B --> C[Find first DP in row 2]
+    C --> D{DP found and a digit follows?}
+    D -- No --> X[Reject frame]
+    D -- Yes --> E[Append fractional digits]
+    E --> F{Second DP or end of row?}
+    F -- Continue --> E
+    F -- Stop --> G[integer + fraction / scale]
+    G --> H[total_volume_l double]
+```
+
+Ví dụ hàng 1 là `2`, hàng 2 có DP đầu tiên rồi chữ số `0`, sau đó gặp DP thứ
+hai, kết quả là `2.0 L`.
+
+### 6.3 Hiển thị local trên LED 3x6
+
+```mermaid
+flowchart TD
+    A[read_totalizer_result success] --> B[Copy captured amount segments to row 1]
+    B --> C[Format volume to 3 decimals]
+    C --> D[Trim trailing fractional zeros]
+    D --> E{Each value <= 6 LED digits?}
+    E -- No --> X[Log error, do not show stale or truncated data]
+    E -- Yes --> F[Put DP-only plus fraction at right of row 2]
+    F --> H[Right-align volume integer on row 3]
+    H --> I[Begin virtual display and set IO39=1]
+    I --> J{Physical key or new pump-prepare generation?}
+    J -- No --> J
+    J -- Yes --> K[Set IO39=0 and restore external display]
+```
+
+Shortcut Totalizer local lấy từ `shortcut_key_10` trong NVS. Firmware dùng
+`P88` làm mặc định khi slot 10 chưa từng được cấu hình. Chỉ khi nhập đủ toàn
+bộ chuỗi thì task Totalizer dùng chung mới được kích hoạt.
+
+Trong chế độ Totalizer local, bất kỳ phím vật lý nào cũng yêu cầu thoát;
+firmware trả IO39 về 0 và không dùng phím thoát để kích hoạt command khác.
+Ngoài ra, nhánh `Bat dau luot bom` của `pump_transaction_filter` tăng một
+`prepare_generation`. Nếu generation thay đổi vì LED decode nhận hàng tiền
+`0` và hàng lít `0.00`/`0.000`, Totalizer tự thoát mà không cần người dùng
+nhấn phím. Kiểm tra dùng generation thay vì chỉ giữ một cờ trạng thái nên
+không bỏ lỡ màn hình chuẩn bị bơm tồn tại trong thời gian ngắn.
 
 ## 7. Set unit price
 
@@ -175,7 +243,7 @@ flowchart TD
     C --> D[Capture generation]
     D --> E[Send E]
     E --> F{Fresh LED: row1 E0 and row3=price?}
-    F -- Yes --> G[Send CC]
+    F -- Yes --> G[Update RAM + last_price NVS, then send CC]
     F -- No and attempts < 3 --> C
     F -- No after 3 --> H[Send CC]
     G --> I[ACK ok: unit_price_updated]
@@ -184,15 +252,41 @@ flowchart TD
 
 ACK được gửi sau khi thao tác và xác nhận LED hoàn tất, nên phản ánh kết quả cuối.
 
-## 8. Calibration
+## 8. Heartbeat và cache đơn giá
 
 ```mermaid
 flowchart TD
-    A[MQTT indexed slot or local shortcut] --> B[Lock totalizer mutex]
-    B --> C[Send C#122973E]
+    A[Heartbeat task starts] --> B{MQTT ready?}
+    B -- No --> C[Retry after 1 second]
+    C --> B
+    B -- Yes --> D[Read timestamp; fallback ts=0]
+    D --> E[Read RSSI; fallback RSSI=0]
+    E --> F[Read RAM unit_price seeded from NVS last_price]
+    F --> G[Fallback unit_price=0 when never known]
+    G --> H[Publish heartbeat QoS 1]
+    H -- Success --> I[Wait 60 seconds]
+    H -- Failure --> C
+    I --> B
+```
+
+Khi sniffer giải mã được hàng 3 hợp lệ hoặc `set_unit_price` verify thành công,
+firmware cập nhật cache RAM ngay. NVS `device_cfg/last_price` chỉ được commit và
+readback nếu giá mới khác giá đã lưu, tránh ghi Flash theo từng frame LED.
+
+## 9. Calibration
+
+```mermaid
+flowchart TD
+    A[MQTT indexed slot, boot, restore or local shortcut] --> B{Source?}
+    B -- MQTT, boot, restore --> B2[Max attempts = 3]
+    B -- Local shortcut --> B3[Capture 3x6 LED snapshot, max attempts = 1]
+    B2 --> B4[Lock totalizer mutex]
+    B3 --> B4
+    B4 --> C
+    C[Send C#122973E]
     C --> D{Fresh row1=P06?}
-    D -- No --> E[Send C and retry, max 3]
-    D -- Yes --> F[Wait 1000 ms]
+    D -- No --> E[Attempt failed]
+    D -- Yes --> F[Wait 50 ms]
     F --> G[Send raw_command]
     G --> H{Fresh row2 equals raw command?}
     H -- No --> E
@@ -202,12 +296,29 @@ flowchart TD
     J -- Yes --> K[Send C]
     K --> L{Source MQTT?}
     L -- Yes --> M[Save slot and mode_calibration, ACK]
-    L -- No --> N[Update mode_calibration, no ACK]
+    L -- Local shortcut --> N[Update mode_calibration, local result=success]
+    L -- Boot or restore --> M2[Finish without local LED notification]
+    E --> E1[Send C]
+    E1 --> E2{Attempts remain?}
+    E2 -- Yes --> C
+    E2 -- No, local shortcut --> N2[Local result=failure]
+    E2 -- No, other source --> M3[Return verification error]
+    N --> O[Wait 500 ms]
+    N2 --> O
+    O --> P[Use saved 3x6 snapshot as virtual LED background]
+    P --> Q{Local result?}
+    Q -- Success --> R[ROW3 COL1 = DP only]
+    Q -- Failure --> S[ROW3 COL1 = letter E]
+    R --> T[Hold 1 second, IO39=0, restore external display]
+    S --> T
 ```
 
-Virtual output được phân biệt với physical input nên không tự kích hoạt shortcut lặp vô hạn.
+Virtual output được phân biệt với physical input nên không tự kích hoạt shortcut
+lặp vô hạn. Snapshot được lấy trước khi màn hình bị chuỗi calibration thay đổi.
+Totalizer local không được bắt đầu trong thời gian LED báo calibration local; trạng thái
+Wi-Fi có quyền ưu tiên và có thể tiếp quản LED.
 
-## 9. Wi-Fi Config Mode
+## 10. Wi-Fi Config Mode
 
 ```mermaid
 sequenceDiagram
@@ -235,7 +346,7 @@ sequenceDiagram
     LED->>LED: IO39=0, return external display control
 ```
 
-## 10. SNTP
+## 11. SNTP
 
 ```mermaid
 flowchart TD
@@ -248,7 +359,30 @@ flowchart TD
     G --> A
 ```
 
-## 11. OTA
+## 12. Thay đổi MQTT config an toàn
+
+```mermaid
+sequenceDiagram
+    participant Server
+    participant Command as mqtt_command task
+    participant Settings as device_settings/NVS
+    participant MQTT as mqtt_manager
+
+    Server->>Command: set_mqtt_config
+    Command->>Settings: stage candidate + previous config
+    Settings-->>Command: commit + readback OK
+    Command-->>Server: ACK mqtt_config_staged (password redacted)
+    Command->>Command: wait 2 s, reboot
+    MQTT->>MQTT: boot with candidate config
+    alt connect + subscribe succeeds
+        MQTT->>Settings: confirm trial and erase mqtt_trial
+    else auth rejected or no READY in 60 s
+        MQTT->>Settings: restore previous config
+        MQTT->>MQTT: reboot and reconnect old broker
+    end
+```
+
+## 13. OTA
 
 ```mermaid
 sequenceDiagram

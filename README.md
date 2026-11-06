@@ -1,5 +1,10 @@
 # KEYBOARD_PHUONG_NAM
 
+Totalizer local view uses shortcut mapping slot 10. Its default is `P88`; MQTT
+may replace it persistently with `shortcut_key_10` (for example `P9E`). Slots
+1-9 remain normal shortcut-to-virtual-key mappings, while slot 10 calls the
+existing common `read_totalizer()` flow and ignores `physical_key_10`.
+
 Firmware ESP-IDF cho ESP32-S3 dùng để:
 
 - đọc bàn phím ma trận 5x5;

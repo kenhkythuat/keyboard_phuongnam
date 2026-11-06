@@ -1379,7 +1379,8 @@ bool device_settings_find_shortcut_suffix(const char *input,
     size_t input_length = strlen(input);
     int best_index = -1;
     size_t best_length = 0U;
-    for (uint16_t index = 0U; index < SHORTCUT_MAPPING_MAX_COUNT; index++) {
+    /* Slot 10 is reserved for the local Totalizer view shortcut. */
+    for (uint16_t index = 0U; index < TOTALIZER_SHORTCUT_SLOT - 1U; index++) {
         if (shortcut_entry_is_empty(&current.mappings[index])) {
             continue;
         }
@@ -1396,6 +1397,100 @@ bool device_settings_find_shortcut_suffix(const char *input,
     }
     *mapping = current.mappings[best_index];
     return true;
+}
+
+esp_err_t device_settings_set_totalizer_shortcut(const char *shortcut_key,
+                                                 const char *physical_key,
+                                                 uint32_t *revision)
+{
+    if (!shortcut_string_is_valid(shortcut_key, SHORTCUT_KEY_MAX_LENGTH)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *stored_physical = physical_key != NULL
+                                      ? physical_key
+                                      : DEFAULT_TOTALIZER_SHORTCUT;
+    if (!shortcut_string_is_valid(stored_physical,
+                                  SHORTCUT_PHYSICAL_KEY_MAX_LENGTH)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Slot 10 keeps this value for MQTT readback only; it is never emitted. */
+    return device_settings_set_shortcut_mapping_at(
+        TOTALIZER_SHORTCUT_SLOT, shortcut_key,
+        stored_physical, revision);
+}
+
+esp_err_t device_settings_get_totalizer_shortcut(char *shortcut_key,
+                                                 size_t size,
+                                                 uint32_t *revision)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (shortcut_key == NULL || size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    shortcut_mapping_t mapping = {0};
+    esp_err_t err = device_settings_get_shortcut_mapping_at(
+        TOTALIZER_SHORTCUT_SLOT, &mapping, revision);
+    const char *source = err == ESP_OK
+                             ? mapping.shortcut_key
+                             : DEFAULT_TOTALIZER_SHORTCUT;
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        return err;
+    }
+    if (strlcpy(shortcut_key, source, size) >= size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (revision != NULL && err == ESP_ERR_NOT_FOUND) {
+        shortcut_store_t current;
+        portENTER_CRITICAL(&s_shortcut_lock);
+        current = s_shortcut_store;
+        portEXIT_CRITICAL(&s_shortcut_lock);
+        *revision = current.revision;
+    }
+    return ESP_OK;
+}
+
+bool device_settings_match_totalizer_shortcut(const char *input,
+                                              bool *is_prefix)
+{
+    if (is_prefix != NULL) {
+        *is_prefix = false;
+    }
+    if (input == NULL || input[0] == '\0') {
+        return false;
+    }
+
+    char shortcut[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
+    if (device_settings_get_totalizer_shortcut(shortcut, sizeof(shortcut),
+                                               NULL) != ESP_OK) {
+        return false;
+    }
+
+    size_t input_length = strlen(input);
+    size_t shortcut_length = strlen(shortcut);
+    if (shortcut_length <= input_length &&
+        strcmp(input + input_length - shortcut_length, shortcut) == 0) {
+        return true;
+    }
+
+    size_t candidate_length = input_length < shortcut_length
+                                  ? input_length
+                                  : shortcut_length - 1U;
+    while (candidate_length > 0U) {
+        if (memcmp(input + input_length - candidate_length,
+                   shortcut, candidate_length) == 0) {
+            if (is_prefix != NULL) {
+                *is_prefix = true;
+            }
+            break;
+        }
+        candidate_length--;
+    }
+    return false;
 }
 
 bool device_settings_calibration_mapping_is_valid(const char *name,

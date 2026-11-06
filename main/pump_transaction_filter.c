@@ -47,6 +47,7 @@ static const char *TAG = "PUMP_FILTER";
 static QueueHandle_t s_display_queue;
 static bool s_started;
 static uint32_t s_current_unit_price;
+static uint32_t s_prepare_generation;
 
 static bool segment_to_digit(uint8_t segments, uint8_t *digit, bool *blank)
 {
@@ -474,6 +475,9 @@ static void pump_transaction_filter_task(void *argument)
                 transaction.unit_price > 0U;
 
             if (is_transaction_start) {
+                __atomic_fetch_add(&s_prepare_generation, 1U,
+                                   __ATOMIC_RELEASE);
+
                 if (transaction_active && has_sale_data) {
                     ESP_LOGI(
                         TAG,
@@ -736,6 +740,11 @@ esp_err_t pump_transaction_filter_get_unit_price(uint32_t *unit_price)
 
     *unit_price = current;
     return ESP_OK;
+}
+
+uint32_t pump_transaction_filter_get_prepare_generation(void)
+{
+    return __atomic_load_n(&s_prepare_generation, __ATOMIC_ACQUIRE);
 }
 
 esp_err_t pump_transaction_filter_update_unit_price(uint32_t unit_price)

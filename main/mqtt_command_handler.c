@@ -53,6 +53,9 @@
 #define PRIMARY_CALIBRATION_SLOT       1U
 #define MODE_RESTORE_DELAY_MS          30000U
 
+_Static_assert(TOTALIZER_LED_COLUMNS == PUMP_DATA_DISPLAY_COLUMNS,
+               "Totalizer result must preserve the complete LED row");
+
 typedef enum {
     COMMAND_MESSAGE_MQTT,
     COMMAND_MESSAGE_MODE_RESTORE,
@@ -339,6 +342,32 @@ static bool get_indexed_param_pair(const cJSON *param,
     return false;
 }
 
+static bool get_totalizer_shortcut_param(const cJSON *param,
+                                         const cJSON **physical_key,
+                                         const cJSON **shortcut_key)
+{
+    if (!cJSON_IsObject(param) || physical_key == NULL ||
+        shortcut_key == NULL) {
+        return false;
+    }
+
+    int field_count = cJSON_GetArraySize(param);
+    const cJSON *shortcut = cJSON_GetObjectItemCaseSensitive(
+        param, "shortcut_key_10");
+    const cJSON *ignored_physical = cJSON_GetObjectItemCaseSensitive(
+        param, "physical_key_10");
+    if (shortcut == NULL || field_count < 1 || field_count > 2) {
+        return false;
+    }
+    if (field_count == 2 && ignored_physical == NULL) {
+        return false;
+    }
+
+    *physical_key = ignored_physical;
+    *shortcut_key = shortcut;
+    return true;
+}
+
 static bool request_was_processed(const char *request_id)
 {
     for (size_t index = 0; index < s_request_history_count; index++) {
@@ -496,7 +525,41 @@ static bool decode_total_amount_display(
         (display[0][5] & 0x7FU) != 0x3FU) {
         return false;
     }
-    return decode_unsigned_row(display[1], total_amount_vnd);
+    uint64_t displayed_digits = 0U;
+    if (!decode_unsigned_row(display[1], &displayed_digits)) {
+        return false;
+    }
+
+    uint8_t dp_mask = 0U;
+    for (size_t column = 0U; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
+        if ((display[1][column] & 0x80U) != 0U) {
+            dp_mask |= (uint8_t)(1U << column);
+        }
+    }
+
+    uint64_t multiplier;
+    if (dp_mask == (1U << 2U)) {
+        multiplier = 1U;
+    } else if (dp_mask == ((1U << 0U) | (1U << 3U))) {
+        multiplier = 10U;
+    } else if (dp_mask == 0U || dp_mask == (1U << 0U)) {
+        multiplier = 10000U;
+    } else {
+        ESP_LOGW(TAG, "Mau DP tong tien khong hop le: mask=0x%02X",
+                 dp_mask);
+        return false;
+    }
+
+    if (displayed_digits > UINT64_MAX / multiplier) {
+        return false;
+    }
+    *total_amount_vnd = displayed_digits * multiplier;
+    ESP_LOGI(TAG,
+             "Giai ma tong tien: digits=%" PRIu64
+             " dp_mask=0x%02X multiplier=%" PRIu64
+             " amount=%" PRIu64,
+             displayed_digits, dp_mask, multiplier, *total_amount_vnd);
+    return true;
 }
 
 static bool decode_reset_total_volume_display(
@@ -565,7 +628,9 @@ static bool decode_total_volume_display(
 }
 
 static bool wait_for_total_amount(uint32_t baseline_generation,
-                                  uint64_t *total_amount_vnd)
+                                  uint64_t *total_amount_vnd,
+                                  uint8_t amount_segments
+                                      [TOTALIZER_LED_COLUMNS])
 {
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
@@ -575,6 +640,10 @@ static bool wait_for_total_amount(uint32_t baseline_generation,
         if (mbi_sniffer_get_display_snapshot(display, &generation) &&
             generation != baseline_generation &&
             decode_total_amount_display(display, total_amount_vnd)) {
+            if (amount_segments != NULL) {
+                memcpy(amount_segments, display[1],
+                       PUMP_DATA_DISPLAY_COLUMNS);
+            }
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
@@ -733,12 +802,16 @@ static uint32_t get_display_generation(void)
     return generation;
 }
 
-static esp_err_t execute_calibration_locked(const char *raw_command)
+static esp_err_t execute_calibration_locked(const char *raw_command,
+                                            uint32_t max_attempts)
 {
-    for (uint32_t attempt = 1U; attempt <= CALIBRATION_MAX_ATTEMPTS;
-         attempt++) {
+    if (max_attempts == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (uint32_t attempt = 1U; attempt <= max_attempts; attempt++) {
         ESP_LOGI(TAG, "Calibration %s lan %u/%u", raw_command,
-                 (unsigned)attempt, (unsigned)CALIBRATION_MAX_ATTEMPTS);
+                 (unsigned)attempt, (unsigned)max_attempts);
 
         uint32_t baseline_generation = get_display_generation();
         esp_err_t err = virtual_key_output_run_sequence(
@@ -798,7 +871,8 @@ esp_err_t execute_calibration_command(const char *raw_command)
         return ESP_ERR_TIMEOUT;
     }
 
-    esp_err_t err = execute_calibration_locked(raw_command);
+    esp_err_t err = execute_calibration_locked(raw_command,
+                                               CALIBRATION_MAX_ATTEMPTS);
     xSemaphoreGive(s_totalizer_mutex);
     return err;
 }
@@ -824,7 +898,15 @@ esp_err_t mqtt_command_handler_execute_local_calibration(
     bool has_restore_candidate = prepare_mode_restore_candidate(
         slot, &restore_candidate);
 
-    esp_err_t err = execute_calibration_command(raw_command);
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_totalizer_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = execute_calibration_locked(raw_command, 1U);
+    xSemaphoreGive(s_totalizer_mutex);
     if (err == ESP_OK) {
         err = device_settings_set_mode_calibration(mode_calibration);
     }
@@ -899,7 +981,9 @@ static void process_mode_restore(uint32_t generation)
              previous_mapping.name);
 }
 
-static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
+static esp_err_t read_total_amount(
+    uint64_t *total_amount_vnd,
+    uint8_t amount_segments[TOTALIZER_LED_COLUMNS])
 {
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Doc tong tien lan %u/%u",
@@ -919,7 +1003,8 @@ static esp_err_t read_total_amount(uint64_t *total_amount_vnd)
             return err;
         }
 
-        if (wait_for_total_amount(baseline_generation, total_amount_vnd)) {
+        if (wait_for_total_amount(baseline_generation, total_amount_vnd,
+                                  amount_segments)) {
             ESP_LOGI(TAG, "Doc tong tien thanh cong: %" PRIu64 " VND",
                      *total_amount_vnd);
             vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
@@ -962,14 +1047,12 @@ static esp_err_t read_total_volume(double *total_volume_l)
     return ESP_ERR_INVALID_RESPONSE;
 }
 
-esp_err_t read_totalizer(uint64_t *total_amount_vnd,
-                         double *total_volume_l)
+esp_err_t read_totalizer_result(totalizer_result_t *result)
 {
-    if (total_amount_vnd == NULL || total_volume_l == NULL) {
+    if (result == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    *total_amount_vnd = 0U;
-    *total_volume_l = 0.0;
+    memset(result, 0, sizeof(*result));
 
     if (s_totalizer_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -978,15 +1061,29 @@ esp_err_t read_totalizer(uint64_t *total_amount_vnd,
         return ESP_ERR_TIMEOUT;
     }
 
-    esp_err_t err = read_total_amount(total_amount_vnd);
+    esp_err_t err = read_total_amount(&result->total_amount_vnd,
+                                      result->amount_segments);
     if (err == ESP_OK) {
-        err = read_total_volume(total_volume_l);
+        err = read_total_volume(&result->total_volume_l);
     }
     if (err != ESP_OK) {
-        *total_amount_vnd = 0U;
-        *total_volume_l = 0.0;
+        memset(result, 0, sizeof(*result));
     }
     xSemaphoreGive(s_totalizer_mutex);
+    return err;
+}
+
+esp_err_t read_totalizer(uint64_t *total_amount_vnd,
+                         double *total_volume_l)
+{
+    if (total_amount_vnd == NULL || total_volume_l == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    totalizer_result_t result;
+    esp_err_t err = read_totalizer_result(&result);
+    *total_amount_vnd = result.total_amount_vnd;
+    *total_volume_l = result.total_volume_l;
     return err;
 }
 
@@ -1027,7 +1124,8 @@ static esp_err_t reset_total_amount(void)
         }
 
         uint64_t current_total = 0U;
-        if (!wait_for_total_amount(baseline_generation, &current_total)) {
+        if (!wait_for_total_amount(baseline_generation, &current_total,
+                                   NULL)) {
             ESP_LOGW(TAG, "Reset tong tien: khong tim thay P20 lan %u",
                      (unsigned)attempt);
             (void)virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
@@ -1780,14 +1878,38 @@ static void process_command(const command_message_t *message)
         const cJSON *physical_key = NULL;
         const cJSON *shortcut_key = NULL;
         uint8_t slot = 0U;
-        bool param_valid = envelope_valid && get_indexed_param_pair(
-            param, "physical_key", "shortcut_key",
-            SHORTCUT_MAPPING_MAX_COUNT, &physical_key, &shortcut_key, &slot) &&
-            string_field_is_valid(physical_key,
-                                  SHORTCUT_PHYSICAL_KEY_MAX_LENGTH) &&
-            string_field_is_valid(shortcut_key, SHORTCUT_KEY_MAX_LENGTH) &&
-            device_settings_shortcut_mapping_is_valid(
-                shortcut_key->valuestring, physical_key->valuestring);
+        bool totalizer_slot = envelope_valid &&
+            get_totalizer_shortcut_param(param, &physical_key,
+                                         &shortcut_key);
+        bool regular_slot = !totalizer_slot && envelope_valid &&
+            get_indexed_param_pair(
+                param, "physical_key", "shortcut_key",
+                TOTALIZER_SHORTCUT_SLOT - 1U,
+                &physical_key, &shortcut_key, &slot);
+        if (totalizer_slot) {
+            slot = TOTALIZER_SHORTCUT_SLOT;
+        }
+        bool param_valid = false;
+        if (totalizer_slot) {
+            param_valid = string_field_is_valid(shortcut_key,
+                                                SHORTCUT_KEY_MAX_LENGTH) &&
+                (physical_key == NULL ||
+                 string_field_is_valid(physical_key,
+                                       SHORTCUT_PHYSICAL_KEY_MAX_LENGTH)) &&
+                device_settings_shortcut_mapping_is_valid(
+                    shortcut_key->valuestring,
+                    physical_key != NULL
+                        ? physical_key->valuestring
+                        : DEFAULT_TOTALIZER_SHORTCUT);
+        } else if (regular_slot) {
+            param_valid =
+                string_field_is_valid(physical_key,
+                                      SHORTCUT_PHYSICAL_KEY_MAX_LENGTH) &&
+                string_field_is_valid(shortcut_key,
+                                      SHORTCUT_KEY_MAX_LENGTH) &&
+                device_settings_shortcut_mapping_is_valid(
+                    shortcut_key->valuestring, physical_key->valuestring);
+        }
         if (!param_valid) {
             esp_err_t ack_err = publish_ack(
                 request_id->valuestring, command->valuestring,
@@ -1801,9 +1923,16 @@ static void process_command(const command_message_t *message)
         }
 
         uint32_t revision = 0U;
-        esp_err_t err = device_settings_set_shortcut_mapping_at(
-            slot, shortcut_key->valuestring, physical_key->valuestring,
-            &revision);
+        esp_err_t err = totalizer_slot
+                            ? device_settings_set_totalizer_shortcut(
+                                  shortcut_key->valuestring,
+                                  physical_key != NULL
+                                      ? physical_key->valuestring
+                                      : NULL,
+                                  &revision)
+                            : device_settings_set_shortcut_mapping_at(
+                                  slot, shortcut_key->valuestring,
+                                  physical_key->valuestring, &revision);
         shortcut_mapping_t readback = {0};
         uint32_t readback_revision = 0U;
         if (err == ESP_OK) {
@@ -1812,8 +1941,14 @@ static void process_command(const command_message_t *message)
             if (err == ESP_OK &&
                 (strcmp(readback.shortcut_key,
                         shortcut_key->valuestring) != 0 ||
-                 strcmp(readback.physical_key,
-                        physical_key->valuestring) != 0 ||
+                 (!totalizer_slot &&
+                  strcmp(readback.physical_key,
+                         physical_key->valuestring) != 0) ||
+                 (totalizer_slot &&
+                  strcmp(readback.physical_key,
+                         physical_key != NULL
+                             ? physical_key->valuestring
+                             : DEFAULT_TOTALIZER_SHORTCUT) != 0) ||
                  readback_revision != revision)) {
                 err = ESP_ERR_INVALID_RESPONSE;
             }
