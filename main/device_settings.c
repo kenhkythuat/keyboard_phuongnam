@@ -1591,6 +1591,33 @@ esp_err_t device_settings_get_calibration_mapping_at(
     return ESP_OK;
 }
 
+esp_err_t device_settings_find_calibration_by_name(
+    const char *name,
+    calibration_mapping_t *mapping)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (name == NULL || mapping == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    calibration_store_t current;
+    portENTER_CRITICAL(&s_calibration_lock);
+    current = s_calibration_store;
+    portEXIT_CRITICAL(&s_calibration_lock);
+
+    for (uint16_t index = 0U;
+         index < CALIBRATION_MAPPING_MAX_COUNT; index++) {
+        if (!calibration_entry_is_empty(&current.mappings[index]) &&
+            strcmp(current.mappings[index].name, name) == 0) {
+            *mapping = current.mappings[index];
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
 bool device_settings_find_calibration_suffix(
     const char *input,
     calibration_mapping_t *mapping)

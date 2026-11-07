@@ -105,7 +105,7 @@ sequenceDiagram
     Filter->>Filter: transaction complete
     Filter->>Time: get snapshot
     Time-->>Filter: invalid / network not ready
-    Filter->>NVS: append transaction + command_code
+    Filter->>NVS: append transaction + command_code + command_value
     loop mỗi 1 giây khi có pending
         Filter->>Time: is_valid()
         Filter->>NVS: peek oldest
@@ -118,7 +118,13 @@ sequenceDiagram
     end
 ```
 
-Queue FIFO tối đa 32 phần tử. Bản ghi hiện lưu tiền, lít, đơn giá và command code, chưa lưu timestamp gốc.
+Khi nhận màn hình bắt đầu lượt bơm, filter đọc `mode_calibration` thành
+`command_code`, sau đó exact-match `name` trong bảng calibration để lấy
+`raw_command` thành `command_value`. Hai chuỗi được giữ trong transaction cho
+đến khi hoàn tất; buffered transaction gửi lại không tra mapping lần nữa.
+
+Queue FIFO tối đa 32 phần tử. Bản ghi lưu tiền, lít, đơn giá,
+`command_code` và `command_value`; chưa lưu timestamp gốc.
 
 ## 5. MQTT command
 
@@ -218,7 +224,11 @@ flowchart TD
     E -- Yes --> F[Put DP-only plus fraction at right of row 2]
     F --> H[Right-align volume integer on row 3]
     H --> I[Begin virtual display and set IO39=1]
-    I --> J{Physical key or new pump-prepare generation?}
+    I --> Q{Time valid and MQTT ready?}
+    Q -- Yes --> R[Queue close_shif event with displayed totals]
+    Q -- No --> S[Log warning; keep displaying]
+    R --> J{Physical key or new pump-prepare generation?}
+    S --> J
     J -- No --> J
     J -- Yes --> K[Set IO39=0 and restore external display]
 ```
@@ -234,6 +244,11 @@ Ngoài ra, nhánh `Bat dau luot bom` của `pump_transaction_filter` tăng một
 `0` và hàng lít `0.00`/`0.000`, Totalizer tự thoát mà không cần người dùng
 nhấn phím. Kiểm tra dùng generation thay vì chỉ giữ một cờ trạng thái nên
 không bỏ lỡ màn hình chuẩn bị bơm tồn tại trong thời gian ngắn.
+
+Khi trang Totalizer đã bật thành công, firmware lấy một snapshot thời gian,
+tạo `event_id=evt-<node_id>-<ts>` và queue event `close_shif` lên topic event.
+Payload dùng chính `total_amount_vnd` và `total_volume_l` đang hiển thị. Queue
+thành công hay thất bại đều không làm thay đổi vòng lặp giữ màn hình LED.
 
 ## 7. Set unit price
 

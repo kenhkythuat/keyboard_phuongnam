@@ -7,11 +7,13 @@
 #include "nvs.h"
 
 #include "device_config.h"
+#include "device_settings.h"
 
 #define STORE_NAMESPACE          "pump_tx"
 #define STORE_BLOB_KEY           "queue"
 #define STORE_MAGIC              0x50545851UL
-#define STORE_VERSION            2U
+#define STORE_VERSION            3U
+#define STORE_PREVIOUS_VERSION   2U
 #define STORE_LEGACY_VERSION     1U
 #define STORE_MAX_TRANSACTIONS   32U
 
@@ -27,6 +29,20 @@ typedef struct {
     uint16_t count;
     pump_stored_transaction_v1_t transactions[STORE_MAX_TRANSACTIONS];
 } pump_store_blob_v1_t;
+
+typedef struct {
+    uint32_t amount_vnd;
+    uint32_t volume_ml;
+    uint32_t unit_price;
+    char command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U];
+} pump_stored_transaction_v2_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    pump_stored_transaction_v2_t transactions[STORE_MAX_TRANSACTIONS];
+} pump_store_blob_v2_t;
 
 typedef struct {
     uint32_t magic;
@@ -47,9 +63,42 @@ static bool command_code_is_stored_valid(const char *command_code)
                   PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U) != NULL;
 }
 
+static bool command_value_is_stored_valid(const char *command_value)
+{
+    const char *terminator = memchr(
+        command_value, '\0', PUMP_TRANSACTION_COMMAND_VALUE_MAX_LENGTH + 1U);
+    if (terminator == NULL) {
+        return false;
+    }
+    for (const char *cursor = command_value; cursor < terminator; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool current_store_is_valid(const pump_store_blob_t *store)
 {
     if (store->magic != STORE_MAGIC || store->version != STORE_VERSION ||
+        store->count > STORE_MAX_TRANSACTIONS) {
+        return false;
+    }
+    for (uint16_t index = 0U; index < store->count; index++) {
+        if (!command_code_is_stored_valid(
+                store->transactions[index].command_code) ||
+            !command_value_is_stored_valid(
+                store->transactions[index].command_value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool previous_store_is_valid(const pump_store_blob_v2_t *store)
+{
+    if (store->magic != STORE_MAGIC ||
+        store->version != STORE_PREVIOUS_VERSION ||
         store->count > STORE_MAX_TRANSACTIONS) {
         return false;
     }
@@ -87,6 +136,16 @@ static void reset_store(void)
     s_store.version = STORE_VERSION;
 }
 
+static void resolve_command_value(pump_stored_transaction_t *transaction)
+{
+    calibration_mapping_t mapping = {0};
+    if (device_settings_find_calibration_by_name(
+            transaction->command_code, &mapping) == ESP_OK) {
+        strlcpy(transaction->command_value, mapping.raw_command,
+                sizeof(transaction->command_value));
+    }
+}
+
 esp_err_t pump_transaction_store_init(void)
 {
     if (s_initialized) {
@@ -100,6 +159,7 @@ esp_err_t pump_transaction_store_init(void)
 
     union {
         pump_store_blob_t current;
+        pump_store_blob_v2_t previous;
         pump_store_blob_v1_t legacy;
     } stored;
     memset(&stored, 0, sizeof(stored));
@@ -111,6 +171,29 @@ esp_err_t pump_transaction_store_init(void)
     } else if (err == ESP_OK && blob_size == sizeof(stored.current) &&
                current_store_is_valid(&stored.current)) {
         s_store = stored.current;
+    } else if (err == ESP_OK && blob_size == sizeof(stored.previous) &&
+               previous_store_is_valid(&stored.previous)) {
+        reset_store();
+        s_store.count = stored.previous.count;
+        for (uint16_t index = 0U; index < s_store.count; index++) {
+            s_store.transactions[index].amount_vnd =
+                stored.previous.transactions[index].amount_vnd;
+            s_store.transactions[index].volume_ml =
+                stored.previous.transactions[index].volume_ml;
+            s_store.transactions[index].unit_price =
+                stored.previous.transactions[index].unit_price;
+            strlcpy(s_store.transactions[index].command_code,
+                    stored.previous.transactions[index].command_code,
+                    sizeof(s_store.transactions[index].command_code));
+            resolve_command_value(&s_store.transactions[index]);
+        }
+        err = commit_store();
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+        ESP_LOGI(TAG, "Da migrate %u giao dich NVS v2 sang v3",
+                 (unsigned)s_store.count);
     } else if (err == ESP_OK && blob_size == sizeof(stored.legacy) &&
                legacy_store_is_valid(&stored.legacy)) {
         reset_store();
@@ -125,6 +208,7 @@ esp_err_t pump_transaction_store_init(void)
             strlcpy(s_store.transactions[index].command_code,
                     DEFAULT_MODE_CALIBRATION,
                     sizeof(s_store.transactions[index].command_code));
+            resolve_command_value(&s_store.transactions[index]);
         }
         err = commit_store();
         if (err != ESP_OK) {
@@ -158,6 +242,9 @@ esp_err_t pump_transaction_store_append(
         return ESP_ERR_INVALID_ARG;
     }
     if (!command_code_is_stored_valid(transaction->command_code)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!command_value_is_stored_valid(transaction->command_value)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_store.count >= STORE_MAX_TRANSACTIONS) {

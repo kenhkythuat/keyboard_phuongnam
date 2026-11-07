@@ -15,9 +15,12 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "cJSON.h"
+
 #include "device_config.h"
 #include "device_settings.h"
 #include "control_display_led.h"
+#include "firmware_version.h"
 #include "pump_data_sniffer.h"
 #include "pump_transaction_filter.h"
 #include "mqtt_command_handler.h"
@@ -51,6 +54,9 @@ static const char *TAG = "KEY_OUTPUT";
 #define TOTALIZER_VIEW_POLL_MS         50U
 #define TOTALIZER_VIEW_TASK_STACK_SIZE 4096U
 #define TOTALIZER_VIEW_MAX_SEGMENTS    CONTROL_DISPLAY_COLUMNS
+#define TOTALIZER_EVENT_JSON_SIZE      384U
+#define TOTALIZER_EVENT_ID_SIZE        64U
+#define LOCAL_CLOSE_SHIFT_EVENT_NAME   "close_shif"
 #define WIFI_CONFIG_LED_POLL_MS        50U
 #define WIFI_CONFIG_LED_TASK_STACK_SIZE 3072U
 
@@ -869,6 +875,79 @@ static bool render_totalizer_display(
     return true;
 }
 
+static esp_err_t publish_local_close_shift_event(
+    const totalizer_result_t *totalizer)
+{
+    if (totalizer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    device_core_config_t core_config;
+    err = device_settings_get_core_config(&core_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char event_id[TOTALIZER_EVENT_ID_SIZE];
+    int event_id_length = snprintf(event_id, sizeof(event_id),
+                                   "evt-%s-%" PRId64,
+                                   core_config.node_id, snapshot.ts);
+    if (event_id_length < 0 ||
+        (size_t)event_id_length >= sizeof(event_id)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    if (root == NULL || reported == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool built =
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               firmware_version_get()) != NULL &&
+        cJSON_AddStringToObject(root, "event_id", event_id) != NULL &&
+        cJSON_AddStringToObject(root, "event",
+                               LOCAL_CLOSE_SHIFT_EVENT_NAME) != NULL &&
+        cJSON_AddStringToObject(root, "source", "device") != NULL &&
+        cJSON_AddStringToObject(root, "trigger", "physical_key") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL;
+    bool reported_attached =
+        built && cJSON_AddItemToObject(root, "reported", reported);
+    built = reported_attached &&
+        cJSON_AddNumberToObject(reported, "total_amount_vnd",
+                               (double)totalizer->total_amount_vnd) != NULL &&
+        cJSON_AddNumberToObject(reported, "total_volume_l",
+                               totalizer->total_volume_l) != NULL &&
+        cJSON_AddStringToObject(root, "time_device",
+                               snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char payload[TOTALIZER_EVENT_JSON_SIZE];
+    if (!cJSON_PrintPreallocated(root, payload, sizeof(payload), false)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON_Delete(root);
+
+    return mqtt_manager_publish_event(payload);
+}
+
 static bool wifi_status_led_is_requested(void)
 {
     wifi_manager_result_t result = wifi_manager_get_connection_result();
@@ -1022,6 +1101,20 @@ static void totalizer_view_task(void *argument)
         ESP_LOGI(TAG, "Shortcut hien thi Totalizer: amount=%" PRIu64
                       " volume=%.3f, IO39=1",
                  totalizer.total_amount_vnd, totalizer.total_volume_l);
+
+        esp_err_t event_err = publish_local_close_shift_event(&totalizer);
+        if (event_err == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Da queue close shift event tu phim vat ly: "
+                     "amount=%" PRIu64 " VND volume=%.3f L",
+                     totalizer.total_amount_vnd,
+                     totalizer.total_volume_l);
+        } else {
+            ESP_LOGW(TAG,
+                     "Khong queue duoc close shift event, van giu man hinh "
+                     "Totalizer: %s",
+                     esp_err_to_name(event_err));
+        }
 
         bool exited_for_pump_prepare = false;
         while (!__atomic_load_n(&s_totalizer_view_exit_requested,

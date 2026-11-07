@@ -293,6 +293,40 @@ Khi thoát, IO39 về `0` và
 `control_display_led_end_virtual()` khôi phục buffer màn hình ngoài. Nếu trạng
 thái Wi-Fi đang cần LED thì quyền hiển thị được bàn giao cho luồng Wi-Fi.
 
+Sau khi IO39 được bật và trang Totalizer local bắt đầu hiển thị thành công,
+firmware chủ động publish một event chốt ca lên
+`tbmq/keyboard/<node_id>/event`, QoS 1, retain false. Event này chỉ áp dụng
+cho phím tắt Totalizer vật lý; command MQTT `get_totalizer` và `close_shift`
+giữ nguyên luồng riêng.
+
+```json
+{
+  "ts": 1793933258,
+  "version": "1.3",
+  "event_id": "evt-node_kbd_029-1793933258",
+  "event": "close_shif",
+  "source": "device",
+  "trigger": "physical_key",
+  "result": "ok",
+  "reported": {
+    "total_amount_vnd": 8665400,
+    "total_volume_l": 273.6
+  },
+  "time_device": "06/11/2026 09:47:38"
+}
+```
+
+`event_id` được tạo từ `node_id` đang dùng trong NVS và cùng `ts` của
+`time_manager_get_snapshot()`: `evt-<node_id>-<ts>`. Hai giá trị trong
+`reported` lấy trực tiếp từ cùng `totalizer_result_t` đang được hiển thị.
+Giá trị wire-format của field `event` hiện là `close_shif` theo contract server
+đã cung cấp.
+
+Publish event chỉ queue MQTT và không thay đổi `s_totalizer_view_active` hay
+`s_totalizer_view_exit_requested`. Nếu time chưa valid hoặc MQTT chưa ready,
+firmware log cảnh báo và vẫn giữ màn hình Totalizer; event không được dựng với
+timestamp giả và không làm tắt LED.
+
 ### 6.5 `close_shift`
 
 `param` phải rỗng. Reuse `read_totalizer()` giống `get_totalizer` nhưng chỉ ACK:
@@ -512,6 +546,7 @@ command/ACK. `PROJECT_VER` hiện tại là `1.8`.
     "amount_vnd": 7850,
     "volume_ml": 314,
     "command_code": "P555",
+    "command_value": "2530",
     "time_device": "14/09/2026 14:07:01",
     "is_buffered": false,
     "RSSI": -30
@@ -527,6 +562,7 @@ command/ACK. `PROJECT_VER` hiện tại là `1.8`.
 | `amount_vnd` | number | VNĐ |
 | `volume_ml` | number | mL |
 | `command_code` | string | mode calibration tại lúc bắt đầu lượt bơm |
+| `command_value` | string | `raw_command` được ánh xạ chính xác với `command_code` tại lúc bắt đầu lượt bơm |
 | `time_device` | string | `DD/MM/YYYY HH:mm:ss`, Asia/Ho_Chi_Minh |
 | `is_buffered` | boolean | `true` khi đọc từ NVS pending |
 | `RSSI` | integer | dBm |
@@ -534,11 +570,17 @@ command/ACK. `PROJECT_VER` hiện tại là `1.8`.
 Validation trước publish:
 
 - ba giá trị giao dịch phải lớn hơn 0;
-- `command_code` hợp lệ;
+- `command_code` hợp lệ; firmware tra exact-match trong calibration mapping để
+  đóng băng `command_value` tương ứng;
 - chênh lệch tiền so với `unit_price * volume_ml / 1000` không quá 200 VNĐ;
 - time valid, lấy được RSSI và MQTT ready.
 
-Nếu chưa đủ điều kiện mạng/time, lưu tối đa 32 giao dịch vào NVS. Bản ghi giữ `command_code` gốc nhưng hiện chưa giữ timestamp gốc; thời gian được lấy lúc gửi lại.
+Nếu chưa đủ điều kiện mạng/time, lưu tối đa 32 giao dịch vào NVS. Bản ghi giữ
+cả `command_code` và `command_value` gốc nhưng hiện chưa giữ timestamp gốc;
+thời gian được lấy lúc gửi lại. Queue giao dịch dùng schema version 3. Khi boot
+firmware migrate schema version 2 bằng cách giữ `command_code` và tra mapping
+NVS hiện có để bổ sung `command_value`; schema version 1 dùng mode mặc định rồi
+thực hiện cùng phép tra.
 
 ## 9. Totalizer telemetry
 

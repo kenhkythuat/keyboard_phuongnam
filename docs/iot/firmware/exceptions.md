@@ -20,6 +20,9 @@
 | Nhấn phím khi đang xem Totalizer | Tiêu thụ phím, thoát, IO39 về 0; không chạy command khác |
 | LED decode nhận màn hình chuẩn bị bơm `0 / 0.00` hoặc `0 / 0.000` | Tăng `prepare_generation`; Totalizer tự thoát, IO39 về 0 và trả LED cho mạch ngoài |
 | Màn hình chuẩn bị bơm xuất hiện trong lúc đang đọc tổng | Sau khi đọc xong thấy generation đã đổi; không bật Virtual LED bằng dữ liệu Totalizer vừa đọc |
+| Totalizer local hiển thị được nhưng time chưa sync | Không tạo `ts=0`; log cảnh báo, không gửi event và vẫn giữ màn hình |
+| Totalizer local hiển thị được nhưng MQTT chưa ready/queue lỗi | Log cảnh báo, không retry blocking và vẫn giữ màn hình cho tới điều kiện thoát bình thường |
+| Không đọc được `node_id` runtime từ NVS | Không tạo `event_id`; bỏ lần publish event nhưng không ảnh hưởng hiển thị |
 
 ## Totalizer Shortcut Slot 10
 
@@ -107,6 +110,9 @@ Giao dịch invalid do công thức hiện không được retry và không gử
 | Mapping trùng shortcut ở slot khác | `ESP_ERR_INVALID_ARG`, ACK `invalid_param` |
 | Ghi mapping xong readback sai | ACK `reported_mismatch` hoặc `verification_failed` |
 | Mode calibration chưa lưu | Dùng mặc định `P1E` |
+| `command_code` không có calibration mapping tương ứng | Log cảnh báo; giữ `command_value` rỗng thay vì suy đoán raw command từ mode khác |
+| Queue giao dịch NVS schema version 2 | Migrate sang version 3, giữ dữ liệu cũ và exact-match mapping hiện tại để bổ sung `command_value` |
+| Mapping thay đổi sau khi giao dịch đã bắt đầu | Không cập nhật transaction đang chạy hoặc pending; telemetry giữ `command_value` đã chụp lúc bắt đầu bơm |
 | `last_price` chưa tồn tại sau nâng cấp firmware | Trạng thái lần đầu hợp lệ; dùng `unit_price=0` cho tới khi LED hoặc `set_unit_price` cung cấp giá |
 | `last_price` bằng 0 hoặc lớn hơn 999999 | Xóa cache sai, tiếp tục chạy và chờ giá hợp lệ |
 | Giá mới trùng giá NVS | Không commit Flash lại |

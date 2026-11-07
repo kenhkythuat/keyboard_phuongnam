@@ -95,6 +95,9 @@ esp_err_t device_settings_set_calibration_mapping_at(
 esp_err_t device_settings_get_calibration_mapping_at(
     uint8_t slot,
     calibration_mapping_t *mapping);
+esp_err_t device_settings_find_calibration_by_name(
+    const char *name,
+    calibration_mapping_t *mapping);
 bool device_settings_find_calibration_suffix(
     const char *input,
     calibration_mapping_t *mapping);

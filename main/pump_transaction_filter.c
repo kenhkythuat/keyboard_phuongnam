@@ -26,7 +26,7 @@
 #define FILTER_TASK_STACK_SIZE     4096U
 #define FILTER_TASK_PRIORITY       5U
 #define FILTER_QUEUE_LENGTH        8U
-#define TELEMETRY_JSON_SIZE        384U
+#define TELEMETRY_JSON_SIZE        448U
 #define PENDING_RETRY_MS           1000U
 
 typedef struct {
@@ -224,6 +224,8 @@ static esp_err_t publish_transaction_telemetry(
         cJSON_AddNumberToObject(data, "volume_ml", transaction->volume_ml) == NULL ||
         cJSON_AddStringToObject(data, "command_code",
                                transaction->command_code) == NULL ||
+        cJSON_AddStringToObject(data, "command_value",
+                               transaction->command_value) == NULL ||
         cJSON_AddStringToObject(data, "time_device", time_snapshot->time_device) == NULL ||
         cJSON_AddBoolToObject(data, "is_buffered", is_buffered) == NULL ||
         cJSON_AddNumberToObject(data, "RSSI", rssi) == NULL) {
@@ -344,6 +346,7 @@ static transaction_report_result_t report_completed_transaction(
     ESP_LOGI(TAG, "ts=%" PRId64, time_snapshot.ts);
     ESP_LOGI(TAG, "time_device=%s", time_snapshot.time_device);
     ESP_LOGI(TAG, "command_code=%s", transaction->command_code);
+    ESP_LOGI(TAG, "command_value=%s", transaction->command_value);
     ESP_LOGI(TAG, "is_buffered=%s", is_buffered ? "true" : "false");
     ESP_LOGI(TAG, "RSSI=%d dBm", (int)rssi);
     ESP_LOGI(
@@ -392,6 +395,7 @@ static void pump_transaction_filter_task(void *argument)
     pump_transaction_t idle_positive_transaction = {0};
     pump_transaction_t pre_start_transaction = {0};
     char active_command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U] = {0};
+    char active_command_value[PUMP_TRANSACTION_COMMAND_VALUE_MAX_LENGTH + 1U] = {0};
     bool transaction_active = false;
     bool has_sale_data = false;
     bool has_positive_sample = false;
@@ -502,6 +506,22 @@ static void pump_transaction_filter_task(void *argument)
                 }
                 strlcpy(active_command_code, transaction.command_code,
                         sizeof(active_command_code));
+                calibration_mapping_t calibration_mapping = {0};
+                esp_err_t mapping_result =
+                    device_settings_find_calibration_by_name(
+                        transaction.command_code, &calibration_mapping);
+                if (mapping_result == ESP_OK) {
+                    strlcpy(transaction.command_value,
+                            calibration_mapping.raw_command,
+                            sizeof(transaction.command_value));
+                } else {
+                    ESP_LOGW(TAG,
+                             "Mode %s chua co raw_command tuong ung: %s",
+                             transaction.command_code,
+                             esp_err_to_name(mapping_result));
+                }
+                strlcpy(active_command_value, transaction.command_value,
+                        sizeof(active_command_value));
                 transaction_active = true;
                 has_sale_data = false;
                 has_positive_sample = false;
@@ -536,6 +556,8 @@ static void pump_transaction_filter_task(void *argument)
 
             strlcpy(transaction.command_code, active_command_code,
                     sizeof(transaction.command_code));
+            strlcpy(transaction.command_value, active_command_value,
+                    sizeof(transaction.command_value));
 
             bool positive_values =
                 transaction.amount_vnd > 0U &&
@@ -664,6 +686,7 @@ static void pump_transaction_filter_task(void *argument)
         memset(&pre_start_transaction, 0,
                sizeof(pre_start_transaction));
         memset(active_command_code, 0, sizeof(active_command_code));
+        memset(active_command_value, 0, sizeof(active_command_value));
     }
 }
 
