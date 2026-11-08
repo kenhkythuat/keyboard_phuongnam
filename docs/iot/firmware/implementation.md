@@ -430,6 +430,18 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 - Chỉ sau verify thành công mới lưu mapping và `mode_calibration=name`.
 - ACK `calibration_command_applied`, reported gồm `name`, `command_echo`, `mode_calibration`.
 
+Khi boot, firmware không ghi calibration lại ngay. Nó phát `C#122973E`, chờ
+frame mới có `P06`, đọc hàng 2 và so sánh với `raw_command` của
+`mode_calibration` trong NVS. DP định dạng trên hàng 2 được bỏ qua khi so sánh.
+Nếu hai giá trị bằng nhau, firmware gửi `C` để thoát. Nếu khác, firmware ghi
+nhận event pending `calibration_mismatch`, áp dụng lại raw command và verify
+`E0` như flow calibration bình thường.
+
+Sau khi thoát, hai frame hàng 3 liên tiếp phải decode ra cùng một giá trước khi
+so sánh với `last_unit_price` trong NVS. Giá khác nhau tạo event pending
+`price_mismatch`. Hai event chỉ được publish sau khi MQTT ready và SNTP hợp lệ;
+không có giá NVS hoặc không decode được hàng 3 thì chỉ log, không báo mismatch.
+
 Slot 1 là mode calibration tạm thời. Nếu thiết bị đang ở mode thuộc slot 2-5
 rồi nhận và áp dụng thành công `name_1/raw_command_1`, firmware lưu mode cũ
 trong NVS `device_cfg/cal_restore`. Sau khi một giao dịch mang command code của

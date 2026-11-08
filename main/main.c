@@ -57,6 +57,9 @@ static const char *TAG = "KEY_OUTPUT";
 #define TOTALIZER_EVENT_JSON_SIZE      384U
 #define TOTALIZER_EVENT_ID_SIZE        64U
 #define LOCAL_CLOSE_SHIFT_EVENT_NAME   "close_shif"
+#define BOOT_DIAGNOSTIC_EVENT_JSON_SIZE 512U
+#define BOOT_DIAGNOSTIC_TASK_STACK_SIZE 4096U
+#define BOOT_DIAGNOSTIC_RETRY_MS        1000U
 #define WIFI_CONFIG_LED_POLL_MS        50U
 #define WIFI_CONFIG_LED_TASK_STACK_SIZE 3072U
 
@@ -125,6 +128,16 @@ typedef enum {
     WIFI_STATUS_LED_FAIL,
 } wifi_status_led_view_t;
 
+typedef struct {
+    bool calibration_mismatch;
+    char expected_command_code[SHORTCUT_KEY_MAX_LENGTH + 1U];
+    char expected_command_value[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
+    char actual_command_value[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
+    bool price_mismatch;
+    uint32_t expected_price_vnd;
+    uint32_t actual_price_vnd;
+} boot_diagnostic_state_t;
+
 static SemaphoreHandle_t s_key_output_mutex;
 static QueueHandle_t s_shortcut_output_queue;
 static bool s_virtual_output_active;
@@ -134,6 +147,7 @@ static bool s_totalizer_view_exit_requested;
 static uint32_t s_totalizer_view_prepare_generation;
 static bool s_local_calibration_led_active;
 static wifi_status_led_view_t s_wifi_status_led_view;
+static boot_diagnostic_state_t s_boot_diagnostics;
 
 static bool wifi_status_led_is_requested(void);
 
@@ -948,6 +962,157 @@ static esp_err_t publish_local_close_shift_event(
     return mqtt_manager_publish_event(payload);
 }
 
+static esp_err_t publish_boot_diagnostic_event(bool calibration_event,
+                                               uint32_t sequence)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    device_core_config_t core_config;
+    err = device_settings_get_core_config(&core_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char event_id[TOTALIZER_EVENT_ID_SIZE];
+    int event_id_length = snprintf(event_id, sizeof(event_id),
+                                   "evt-%s-%" PRId64 "-%06" PRIu32,
+                                   core_config.node_id, snapshot.ts, sequence);
+    if (event_id_length < 0 ||
+        (size_t)event_id_length >= sizeof(event_id)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const char *event_name = calibration_event ?
+        "calibration_mismatch" : "price_mismatch";
+    const char *severity = calibration_event ? "error" : "warning";
+    bool built =
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                               firmware_version_get()) != NULL &&
+        cJSON_AddStringToObject(root, "event_id", event_id) != NULL &&
+        cJSON_AddStringToObject(root, "event", event_name) != NULL &&
+        cJSON_AddStringToObject(root, "source", "device") != NULL &&
+        cJSON_AddStringToObject(root, "trigger", "system") != NULL &&
+        cJSON_AddStringToObject(root, "severity", severity) != NULL &&
+        cJSON_AddStringToObject(root, "status", "active") != NULL;
+    bool data_attached = built && cJSON_AddItemToObject(root, "data", data);
+
+    if (data_attached && calibration_event) {
+        built =
+            cJSON_AddStringToObject(data, "parameter",
+                                   "mode_calibration") != NULL &&
+            cJSON_AddStringToObject(
+                data, "expected_command_code",
+                s_boot_diagnostics.expected_command_code) != NULL &&
+            cJSON_AddStringToObject(
+                data, "expected_command_value",
+                s_boot_diagnostics.expected_command_value) != NULL &&
+            cJSON_AddStringToObject(
+                data, "actual_command_value",
+                s_boot_diagnostics.actual_command_value) != NULL;
+    } else if (data_attached) {
+        built =
+            cJSON_AddNumberToObject(
+                data, "expected_price_vnd",
+                (double)s_boot_diagnostics.expected_price_vnd) != NULL &&
+            cJSON_AddNumberToObject(
+                data, "actual_price_vnd",
+                (double)s_boot_diagnostics.actual_price_vnd) != NULL;
+    } else {
+        built = false;
+    }
+
+    built = built &&
+        cJSON_AddStringToObject(root, "time_device",
+                               snapshot.time_device) != NULL;
+    if (!built) {
+        if (!data_attached) {
+            cJSON_Delete(data);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char payload[BOOT_DIAGNOSTIC_EVENT_JSON_SIZE];
+    if (!cJSON_PrintPreallocated(root, payload, sizeof(payload), false)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    cJSON_Delete(root);
+
+    err = mqtt_manager_publish_event(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Da queue boot diagnostic event=%s", event_name);
+    }
+    return err;
+}
+
+static void boot_diagnostic_event_task(void *argument)
+{
+    (void)argument;
+    uint32_t event_sequence = 1U;
+
+    while (s_boot_diagnostics.calibration_mismatch ||
+           s_boot_diagnostics.price_mismatch) {
+        if (!mqtt_manager_is_ready() || !time_manager_is_valid()) {
+            vTaskDelay(pdMS_TO_TICKS(BOOT_DIAGNOSTIC_RETRY_MS));
+            continue;
+        }
+
+        if (s_boot_diagnostics.calibration_mismatch) {
+            esp_err_t err = publish_boot_diagnostic_event(true,
+                                                          event_sequence);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Gui calibration_mismatch chua thanh cong: %s",
+                         esp_err_to_name(err));
+                vTaskDelay(pdMS_TO_TICKS(BOOT_DIAGNOSTIC_RETRY_MS));
+                continue;
+            }
+            s_boot_diagnostics.calibration_mismatch = false;
+            event_sequence++;
+        }
+
+        if (s_boot_diagnostics.price_mismatch) {
+            esp_err_t err = publish_boot_diagnostic_event(false,
+                                                          event_sequence);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Gui price_mismatch chua thanh cong: %s",
+                         esp_err_to_name(err));
+                vTaskDelay(pdMS_TO_TICKS(BOOT_DIAGNOSTIC_RETRY_MS));
+                continue;
+            }
+            s_boot_diagnostics.price_mismatch = false;
+            event_sequence++;
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+static esp_err_t boot_diagnostic_event_start(void)
+{
+    if (!s_boot_diagnostics.calibration_mismatch &&
+        !s_boot_diagnostics.price_mismatch) {
+        return ESP_OK;
+    }
+
+    return xTaskCreate(boot_diagnostic_event_task, "boot_diag_event",
+                       BOOT_DIAGNOSTIC_TASK_STACK_SIZE, NULL, 4, NULL) ==
+               pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 static bool wifi_status_led_is_requested(void)
 {
     wifi_manager_result_t result = wifi_manager_get_connection_result();
@@ -1420,6 +1585,8 @@ static esp_err_t initialize_nvs_before_network(void)
 
 static esp_err_t reapply_calibration_mode_on_boot(void)
 {
+    memset(&s_boot_diagnostics, 0, sizeof(s_boot_diagnostics));
+
     char mode[SHORTCUT_KEY_MAX_LENGTH + 1U] = {0};
     esp_err_t err = device_settings_get_mode_calibration(mode, sizeof(mode));
     if (err != ESP_OK) {
@@ -1443,11 +1610,44 @@ static esp_err_t reapply_calibration_mode_on_boot(void)
         return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "Ap dung lai mode boot %s voi raw_command=%s",
+    uint32_t expected_unit_price = 0U;
+    esp_err_t price_result = device_settings_get_last_unit_price(
+        &expected_unit_price);
+
+    ESP_LOGI(TAG, "Kiem tra mode boot %s voi raw_command=%s",
              mode, mapping.raw_command);
-    err = execute_calibration_command(mapping.raw_command);
+    boot_calibration_check_t check = {0};
+    err = mqtt_command_handler_check_boot_calibration(mapping.raw_command,
+                                                       &check);
+    if (check.calibration_observed && check.calibration_mismatch) {
+        s_boot_diagnostics.calibration_mismatch = true;
+        strlcpy(s_boot_diagnostics.expected_command_code, mode,
+                sizeof(s_boot_diagnostics.expected_command_code));
+        strlcpy(s_boot_diagnostics.expected_command_value,
+                mapping.raw_command,
+                sizeof(s_boot_diagnostics.expected_command_value));
+        strlcpy(s_boot_diagnostics.actual_command_value,
+                check.actual_command_value,
+                sizeof(s_boot_diagnostics.actual_command_value));
+    }
+
+    if (price_result == ESP_OK && check.unit_price_observed &&
+        expected_unit_price != check.actual_unit_price) {
+        s_boot_diagnostics.price_mismatch = true;
+        s_boot_diagnostics.expected_price_vnd = expected_unit_price;
+        s_boot_diagnostics.actual_price_vnd = check.actual_unit_price;
+        ESP_LOGW(TAG,
+                 "Gia boot sai: expected=%" PRIu32 " actual=%" PRIu32,
+                 expected_unit_price, check.actual_unit_price);
+    } else if (price_result == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Chua co unit_price trong NVS, bo qua doi chieu gia boot");
+    } else if (price_result == ESP_OK && !check.unit_price_observed) {
+        ESP_LOGW(TAG, "Khong doc duoc gia hang 3, bo qua doi chieu gia boot");
+    }
+
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Da ap dung lai mode boot %s truoc khi bat Wi-Fi", mode);
+        ESP_LOGI(TAG, "Da kiem tra/ap dung mode boot %s truoc khi bat Wi-Fi",
+                 mode);
     } else {
         ESP_LOGE(TAG, "Ap dung lai mode boot %s that bai: %s",
                  mode, esp_err_to_name(err));
@@ -1511,6 +1711,12 @@ void app_main(void)
     esp_err_t mqtt_result = mqtt_manager_start();
     if (mqtt_result != ESP_OK) {
         ESP_LOGE(TAG, "MQTT manager init failed: %s", esp_err_to_name(mqtt_result));
+    }
+
+    esp_err_t boot_event_result = boot_diagnostic_event_start();
+    if (boot_event_result != ESP_OK) {
+        ESP_LOGE(TAG, "Boot diagnostic event init failed: %s",
+                 esp_err_to_name(boot_event_result));
     }
 
     esp_err_t ota_result = ota_manager_start();

@@ -90,6 +90,9 @@ Giao dịch invalid do công thức hiện không được retry và không gử
 | Tổng tiền/tổng lít decode lỗi | Retry tối đa 3 lần |
 | Một phần totalizer thất bại | Trả cả hai giá trị về 0, không publish telemetry hợp lệ |
 | Raw calibration MQTT/boot/restore không khớp | Retry toàn bộ calibration tối đa 3 lần |
+| Boot đọc được `P06` nhưng raw command khác NVS | Chụp expected/actual, áp dụng lại mode và gửi `calibration_mismatch` khi MQTT/time ready |
+| Giá hàng 3 sau boot khác `last_unit_price` | Chụp hai frame ổn định và gửi `price_mismatch` khi MQTT/time ready |
+| Chưa có `last_unit_price` hoặc không decode được hàng 3 | Chỉ log và bỏ qua đối chiếu, không tạo cảnh báo giả |
 | Calibration shortcut local không khớp | Chỉ chạy 1 lần, gửi `C` để thoát và không retry |
 | Calibration local thất bại | Không ghi mode mới; sau 500 ms mô phỏng snapshot cũ và hiển thị `E` tại hàng 3 cột 1 |
 | Calibration local thành công | Sau 500 ms mô phỏng snapshot cũ và chỉ sáng DP tại hàng 3 cột 1 |

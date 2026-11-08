@@ -710,9 +710,6 @@ static bool display_row_matches_raw_command(
 
     size_t first_digit = PUMP_DATA_DISPLAY_COLUMNS - length;
     for (size_t column = 0U; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
-        if ((row[column] & 0x80U) != 0U) {
-            return false;
-        }
         if (column < first_digit) {
             if ((row[column] & 0x7FU) != 0x00U) {
                 return false;
@@ -728,6 +725,98 @@ static bool display_row_matches_raw_command(
         }
     }
     return true;
+}
+
+static bool decode_calibration_command_row(
+    const uint8_t row[PUMP_DATA_DISPLAY_COLUMNS],
+    char output[BOOT_CALIBRATION_VALUE_MAX_LENGTH + 1U])
+{
+    size_t length = 0U;
+    bool found_digit = false;
+
+    for (size_t column = 0U; column < PUMP_DATA_DISPLAY_COLUMNS; column++) {
+        uint8_t digit = 0U;
+        bool blank = false;
+        if (!segment_to_digit(row[column], &digit, &blank)) {
+            return false;
+        }
+        if (blank) {
+            if (found_digit) {
+                return false;
+            }
+            continue;
+        }
+
+        found_digit = true;
+        if (length >= BOOT_CALIBRATION_VALUE_MAX_LENGTH) {
+            return false;
+        }
+        output[length++] = (char)('0' + digit);
+    }
+
+    output[length] = '\0';
+    return found_digit;
+}
+
+static bool wait_for_boot_calibration_screen(
+    uint32_t baseline_generation,
+    char actual_command[BOOT_CALIBRATION_VALUE_MAX_LENGTH + 1U])
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            display_has_p06(display) &&
+            decode_calibration_command_row(display[1], actual_command)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
+}
+
+static bool wait_for_normal_unit_price(uint32_t baseline_generation,
+                                       uint32_t *unit_price)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(TOTALIZER_VERIFY_TIMEOUT_MS);
+    uint32_t candidate_price = 0U;
+    uint32_t candidate_generation = baseline_generation;
+    uint8_t confirmation_count = 0U;
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        uint8_t display[PUMP_DATA_DISPLAY_ROWS][PUMP_DATA_DISPLAY_COLUMNS];
+        uint32_t generation = 0U;
+        uint64_t decoded = 0U;
+        if (mbi_sniffer_get_display_snapshot(display, &generation) &&
+            generation != baseline_generation &&
+            !display_has_p06(display) &&
+            !display_has_e0(display) &&
+            decode_unsigned_row(display[2], &decoded) &&
+            decoded > 0U && decoded <= UINT32_MAX) {
+            uint32_t decoded_price = (uint32_t)decoded;
+            if (generation != candidate_generation) {
+                if (confirmation_count > 0U &&
+                    candidate_price == decoded_price) {
+                    confirmation_count++;
+                } else {
+                    candidate_price = decoded_price;
+                    confirmation_count = 1U;
+                }
+                candidate_generation = generation;
+                if (confirmation_count >= 2U) {
+                    *unit_price = candidate_price;
+                    return true;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(SET_UNIT_PRICE_VERIFY_POLL_MS));
+    }
+    return false;
 }
 
 static bool wait_for_calibration_display(uint32_t baseline_generation,
@@ -875,6 +964,120 @@ esp_err_t execute_calibration_command(const char *raw_command)
                                                CALIBRATION_MAX_ATTEMPTS);
     xSemaphoreGive(s_totalizer_mutex);
     return err;
+}
+
+esp_err_t mqtt_command_handler_check_boot_calibration(
+    const char *expected_raw_command,
+    boot_calibration_check_t *check)
+{
+    if (check == NULL ||
+        !device_settings_calibration_mapping_is_valid(
+            "P", expected_raw_command)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(check, 0, sizeof(*check));
+
+    if (s_totalizer_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_totalizer_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_ERR_INVALID_RESPONSE;
+    for (uint32_t attempt = 1U; attempt <= CALIBRATION_MAX_ATTEMPTS;
+         attempt++) {
+        ESP_LOGI(TAG, "Kiem tra calibration boot %s lan %u/%u",
+                 expected_raw_command, (unsigned)attempt,
+                 (unsigned)CALIBRATION_MAX_ATTEMPTS);
+
+        uint32_t baseline_generation = get_display_generation();
+        esp_err_t err = virtual_key_output_run_sequence(
+            CALIBRATION_ENTRY_SEQUENCE, VIRTUAL_KEY_INTERVAL_MS);
+        char actual_command[BOOT_CALIBRATION_VALUE_MAX_LENGTH + 1U] = {0};
+        if (err != ESP_OK ||
+            !wait_for_boot_calibration_screen(baseline_generation,
+                                              actual_command)) {
+            ESP_LOGW(TAG, "Boot calibration khong doc duoc P06/command lan %u",
+                     (unsigned)attempt);
+            (void)virtual_key_output_run_sequence(
+                "C", VIRTUAL_KEY_INTERVAL_MS);
+            vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+            continue;
+        }
+
+        check->calibration_observed = true;
+        bool current_mismatch =
+            strcmp(actual_command, expected_raw_command) != 0;
+        if (current_mismatch && !check->calibration_mismatch) {
+            strlcpy(check->actual_command_value, actual_command,
+                    sizeof(check->actual_command_value));
+            check->calibration_mismatch = true;
+        } else if (!check->calibration_mismatch) {
+            strlcpy(check->actual_command_value, actual_command,
+                    sizeof(check->actual_command_value));
+        }
+
+        if (!current_mismatch) {
+            ESP_LOGI(TAG,
+                     "Calibration boot da dung: expected=%s actual=%s, bo qua ghi lai",
+                     expected_raw_command, actual_command);
+        } else {
+            ESP_LOGW(TAG,
+                     "Calibration boot sai: expected=%s actual=%s, ap dung lai",
+                     expected_raw_command, actual_command);
+            vTaskDelay(pdMS_TO_TICKS(CALIBRATION_RAW_COMMAND_DELAY_MS));
+            baseline_generation = get_display_generation();
+            err = virtual_key_output_run_sequence(
+                expected_raw_command, VIRTUAL_KEY_INTERVAL_MS);
+            if (err != ESP_OK ||
+                !wait_for_calibration_display(baseline_generation,
+                                              expected_raw_command,
+                                              false, false)) {
+                ESP_LOGW(TAG, "Boot calibration khong xac nhan duoc command echo");
+                (void)virtual_key_output_run_sequence(
+                    "C", VIRTUAL_KEY_INTERVAL_MS);
+                vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+                continue;
+            }
+
+            baseline_generation = get_display_generation();
+            err = virtual_key_output_run_sequence("E",
+                                                  VIRTUAL_KEY_INTERVAL_MS);
+            if (err != ESP_OK ||
+                !wait_for_calibration_display(baseline_generation,
+                                              expected_raw_command,
+                                              false, true)) {
+                ESP_LOGW(TAG, "Boot calibration khong xac nhan duoc E0/echo");
+                (void)virtual_key_output_run_sequence(
+                    "C", VIRTUAL_KEY_INTERVAL_MS);
+                vTaskDelay(pdMS_TO_TICKS(VIRTUAL_KEY_INTERVAL_MS));
+                continue;
+            }
+        }
+
+        baseline_generation = get_display_generation();
+        err = virtual_key_output_run_sequence("C", VIRTUAL_KEY_INTERVAL_MS);
+        if (err != ESP_OK) {
+            result = err;
+            break;
+        }
+
+        check->unit_price_observed = wait_for_normal_unit_price(
+            baseline_generation, &check->actual_unit_price);
+        if (!check->unit_price_observed) {
+            ESP_LOGW(TAG,
+                     "Calibration boot thanh cong nhung chua doc duoc gia hang 3");
+        } else {
+            ESP_LOGI(TAG, "Gia hang 3 sau calibration boot=%" PRIu32,
+                     check->actual_unit_price);
+        }
+        result = ESP_OK;
+        break;
+    }
+
+    xSemaphoreGive(s_totalizer_mutex);
+    return result;
 }
 
 esp_err_t mqtt_command_handler_execute_local_calibration(

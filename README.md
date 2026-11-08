@@ -165,14 +165,18 @@ Nhấn giữ IO0 ổn định hơn 7 giây để mở SoftAP và Web Portal.
 4. Khởi tạo keypad và virtual key output.
 5. Khởi tạo state machine MQTT command/calibration.
 6. Đọc `mode_calibration` từ NVS, tìm `raw_command` trong 5 calibration
-   mapping và áp dụng lại mode đang lưu.
+   mapping, vào màn hình `P06` và so sánh command thực tế. Chỉ áp dụng lại
+   mode khi command thực tế khác giá trị NVS.
 7. Sau khi hoàn tất bước áp dụng mode mới khởi động `wifi_manager`,
    `time_manager`, `mqtt_manager`, OTA và heartbeat.
 8. Tạo task P88, Wi-Fi status LED và keypad scan.
 
-Việc áp dụng lại mode lúc boot chạy trước Wi-Fi và dùng retry/verify calibration
-hiện có. Nếu mode mặc định chưa có mapping hoặc verify thất bại, firmware ghi
-log rồi vẫn tiếp tục start network. Các module mạng vẫn event-driven;
+Kiểm tra mode lúc boot chạy trước Wi-Fi và dùng retry/verify calibration hiện
+có. Sau khi thoát màn hình calibration, firmware đọc hai frame ổn định của hàng
+3 để đối chiếu với `last_unit_price` trong NVS. Sai mode hoặc sai giá được giữ
+pending trong RAM và publish lên topic `event` sau khi MQTT và SNTP sẵn sàng.
+Nếu mode mặc định chưa có mapping hoặc verify thất bại, firmware ghi log rồi
+vẫn tiếp tục start network. Các module mạng vẫn event-driven;
 `app_main()` không chờ Wi-Fi, SNTP hoặc MQTT kết nối.
 
 ## Luồng giải mã LED
