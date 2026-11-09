@@ -52,6 +52,7 @@ static char s_telemetry_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_command_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_ack_topic[MQTT_TOPIC_BUFFER_SIZE];
 static char s_event_topic[MQTT_TOPIC_BUFFER_SIZE];
+static char s_noti_topic[MQTT_TOPIC_BUFFER_SIZE];
 
 static void start_mqtt_config_trial_timer(void);
 static void request_connection(void);
@@ -164,7 +165,12 @@ static esp_err_t build_topics(void)
         return err;
     }
 
-    return build_topic(s_event_topic, sizeof(s_event_topic), "event");
+    err = build_topic(s_event_topic, sizeof(s_event_topic), "event");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return build_topic(s_noti_topic, sizeof(s_noti_topic), "noti");
 }
 
 static esp_err_t validate_configuration(void)
@@ -646,6 +652,7 @@ esp_err_t mqtt_manager_start(void)
     ESP_LOGI(TAG, "Command topic: %s", s_command_topic);
     ESP_LOGI(TAG, "ACK topic: %s", s_ack_topic);
     ESP_LOGI(TAG, "Event topic: %s", s_event_topic);
+    ESP_LOGI(TAG, "Noti topic: %s", s_noti_topic);
 
     if (wifi_manager_is_connected()) {
         start_mqtt_config_trial_timer();
@@ -698,4 +705,9 @@ esp_err_t mqtt_manager_publish_ack(const char *json_payload)
 esp_err_t mqtt_manager_publish_event(const char *json_payload)
 {
     return publish_json(s_event_topic, json_payload);
+}
+
+esp_err_t mqtt_manager_publish_noti(const char *json_payload)
+{
+    return publish_json(s_noti_topic, json_payload);
 }

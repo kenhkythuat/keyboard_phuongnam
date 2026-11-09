@@ -15,3 +15,4 @@ void mqtt_manager_set_command_callback(mqtt_command_callback_t callback);
 esp_err_t mqtt_manager_publish_telemetry(const char *json_payload);
 esp_err_t mqtt_manager_publish_ack(const char *json_payload);
 esp_err_t mqtt_manager_publish_event(const char *json_payload);
+esp_err_t mqtt_manager_publish_noti(const char *json_payload);

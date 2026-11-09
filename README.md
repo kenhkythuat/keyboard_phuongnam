@@ -174,7 +174,9 @@ Nhấn giữ IO0 ổn định hơn 7 giây để mở SoftAP và Web Portal.
 Kiểm tra mode lúc boot chạy trước Wi-Fi và dùng retry/verify calibration hiện
 có. Sau khi thoát màn hình calibration, firmware đọc hai frame ổn định của hàng
 3 để đối chiếu với `last_unit_price` trong NVS. Sai mode hoặc sai giá được giữ
-pending trong RAM và publish lên topic `event` sau khi MQTT và SNTP sẵn sàng.
+pending trong RAM và publish lên topic `noti` sau khi MQTT và SNTP sẵn sàng.
+Nếu không đọc/verify được calibration sau 3 lần, firmware gửi thông báo
+`calibration_verification_failed` thay vì im lặng bỏ qua.
 Nếu mode mặc định chưa có mapping hoặc verify thất bại, firmware ghi log rồi
 vẫn tiếp tục start network. Các module mạng vẫn event-driven;
 `app_main()` không chờ Wi-Fi, SNTP hoặc MQTT kết nối.

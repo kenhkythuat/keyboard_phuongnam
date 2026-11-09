@@ -184,6 +184,7 @@ Bảng hệ số tổng tiền theo đúng format màn hình hiện tại:
 |---|---:|---:|---:|
 | Chỉ cột 3 | `110.450` | `1` | `110450` |
 | Cột 1 và cột 4 | `1.104.50` | `10` | `1104500` |
+| Cột 2 và cột 5 | `10.862.1` | `100` | `10862100` |
 | Không có DP | `110450` | `10000` | `1104500000` |
 | Chỉ cột 1 | `1.10450` | `10000` | `1104500000` |
 
@@ -439,7 +440,8 @@ nhận event pending `calibration_mismatch`, áp dụng lại raw command và ve
 
 Sau khi thoát, hai frame hàng 3 liên tiếp phải decode ra cùng một giá trước khi
 so sánh với `last_unit_price` trong NVS. Giá khác nhau tạo event pending
-`price_mismatch`. Hai event chỉ được publish sau khi MQTT ready và SNTP hợp lệ;
+`price_mismatch`. Hai thông báo được publish lên topic `noti` sau khi MQTT
+ready và SNTP hợp lệ;
 không có giá NVS hoặc không decode được hàng 3 thì chỉ log, không báo mismatch.
 
 Slot 1 là mode calibration tạm thời. Nếu thiết bị đang ở mode thuộc slot 2-5
@@ -543,6 +545,26 @@ Chúng hiện trả `result=rejected`, `description=unsupported_command`.
 ## 8. Transaction telemetry
 
 Topic: `tbmq/keyboard/<node_id>/telemetry`.
+
+### Giải mã `amount_vnd` từ hàng 1
+
+Hàng 1 của màn hình giao dịch dùng cùng quy tắc DP với hàng 2 khi đọc tổng
+tiền. Firmware ghép các chữ số hợp lệ từ trái sang phải, sau đó áp dụng hệ số
+theo DP mask:
+
+| Bố cục hàng 1 | Hệ số `amount_vnd` |
+|---|---:|
+| Chỉ DP cột 3 | `1` |
+| DP cột 1 và cột 4 | `10` |
+| Không DP, cột 1-3 trống và có tối đa 3 số bên phải | `1` |
+| Không DP và đủ 6 cột đều là số | `10000` |
+| Chỉ DP cột 1 và đủ 6 cột đều là số | `100000` |
+
+Ví dụ `[ ][ ][7.][8][5][0]` được giải mã thành `7850 VNĐ`, còn
+`[ ][ ][ ][6][9][0]` được giải mã thành `690 VNĐ`. Mẫu bố cục/DP khác các
+trường hợp trên bị từ chối. `amount_vnd` dùng `uint64_t`; quy tắc này chỉ thay
+đổi hàng 1, còn hàng 2 vẫn được ghép thành `volume_ml` và hàng 3 thành
+`unit_price` theo cơ chế giao dịch hiện tại.
 
 Field `version` của mọi telemetry lấy từ app descriptor qua
 `firmware_version_get()`. Đây cũng là version OTA được sinh từ `PROJECT_VER`;

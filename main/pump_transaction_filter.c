@@ -22,7 +22,7 @@
 #include "wifi_manager.h"
 
 #define PUMP_DATA_STABLE_TIME_MS   50000U
-#define AMOUNT_TOLERANCE_VND       200.0f
+#define AMOUNT_TOLERANCE_VND       200.0
 #define FILTER_TASK_STACK_SIZE     4096U
 #define FILTER_TASK_PRIORITY       5U
 #define FILTER_QUEUE_LENGTH        8U
@@ -132,6 +132,66 @@ static bool parse_display_row(
     return true;
 }
 
+static bool parse_amount_display_row(
+    const uint8_t display[PUMP_TRANSACTION_DISPLAY_ROWS]
+                         [PUMP_TRANSACTION_DISPLAY_COLUMNS],
+    uint64_t *amount_vnd,
+    bool log_invalid_data)
+{
+    uint32_t displayed_digits = 0U;
+    if (!parse_display_row(display, 0U, &displayed_digits,
+                           log_invalid_data)) {
+        return false;
+    }
+
+    uint8_t dp_mask = 0U;
+    uint8_t digit_count = 0U;
+    bool first_three_blank = true;
+    for (uint8_t column = 0U;
+         column < PUMP_TRANSACTION_DISPLAY_COLUMNS;
+         column++) {
+        uint8_t digit = 0U;
+        bool blank = false;
+        if (!segment_to_digit(display[0][column], &digit, &blank)) {
+            return false;
+        }
+        if (!blank) {
+            digit_count++;
+            if (column < 3U) {
+                first_three_blank = false;
+            }
+        }
+        if ((display[0][column] & 0x80U) != 0U) {
+            dp_mask |= (uint8_t)(1U << column);
+        }
+    }
+
+    uint64_t multiplier;
+    if (dp_mask == (1U << 2U)) {
+        multiplier = 1U;
+    } else if (dp_mask == ((1U << 0U) | (1U << 3U))) {
+        multiplier = 10U;
+    } else if (dp_mask == 0U && first_three_blank && digit_count <= 3U) {
+        multiplier = 1U;
+    } else if (dp_mask == 0U && digit_count == 6U) {
+        multiplier = 10000U;
+    } else if (dp_mask == (1U << 0U) && digit_count == 6U) {
+        multiplier = 100000U;
+    } else {
+        if (log_invalid_data) {
+            ESP_LOGW(TAG,
+                     "Dinh dang amount_vnd khong hop le: "
+                     "dp_mask=0x%02X digit_count=%u first_three_blank=%u",
+                     dp_mask, (unsigned int)digit_count,
+                     first_three_blank ? 1U : 0U);
+        }
+        return false;
+    }
+
+    *amount_vnd = (uint64_t)displayed_digits * multiplier;
+    return true;
+}
+
 static bool parse_transaction(
     const pump_display_message_t *message,
     pump_transaction_t *transaction,
@@ -141,8 +201,9 @@ static bool parse_transaction(
         return false;
     }
 
-    return parse_display_row(message->segments, 0,
-                             &transaction->amount_vnd, log_invalid_data) &&
+    return parse_amount_display_row(message->segments,
+                                    &transaction->amount_vnd,
+                                    log_invalid_data) &&
            parse_display_row(message->segments, 1,
                              &transaction->volume_ml, log_invalid_data) &&
            parse_display_row(message->segments, 2,
@@ -220,7 +281,8 @@ static esp_err_t publish_transaction_telemetry(
     }
 
     if (cJSON_AddNumberToObject(data, "unit_price", transaction->unit_price) == NULL ||
-        cJSON_AddNumberToObject(data, "amount_vnd", transaction->amount_vnd) == NULL ||
+        cJSON_AddNumberToObject(data, "amount_vnd",
+                                (double)transaction->amount_vnd) == NULL ||
         cJSON_AddNumberToObject(data, "volume_ml", transaction->volume_ml) == NULL ||
         cJSON_AddStringToObject(data, "command_code",
                                transaction->command_code) == NULL ||
@@ -260,20 +322,20 @@ static transaction_report_result_t report_completed_transaction(
         return TRANSACTION_REPORT_INVALID;
     }
 
-    float expected_amount_vnd =
-        ((float)transaction->unit_price *
-         (float)transaction->volume_ml) /
-        1000.0f;
+    double expected_amount_vnd =
+        ((double)transaction->unit_price *
+         (double)transaction->volume_ml) /
+        1000.0;
 
-    float difference_vnd = fabsf(
-        (float)transaction->amount_vnd - expected_amount_vnd
+    double difference_vnd = fabs(
+        (double)transaction->amount_vnd - expected_amount_vnd
     );
 
     if (difference_vnd > AMOUNT_TOLERANCE_VND) {
         ESP_LOGW(
             TAG,
             "DU LIEU BOM KHONG HOP LE: unit_price=%" PRIu32
-            " amount_vnd=%" PRIu32 " volume_ml=%" PRIu32
+            " amount_vnd=%" PRIu64 " volume_ml=%" PRIu32
             " expected_amount_vnd=%.2f sai_so_vnd=%.2f (cho phep +/-%.0f)",
             transaction->unit_price,
             transaction->amount_vnd,
@@ -296,7 +358,7 @@ static transaction_report_result_t report_completed_transaction(
         ESP_LOGI(TAG, "========================================");
         ESP_LOGI(TAG, "GIAO DICH BOM HOP LE - THOI GIAN CHUA DONG BO");
         ESP_LOGI(TAG, "unit_price=%" PRIu32, transaction->unit_price);
-        ESP_LOGI(TAG, "amount_vnd=%" PRIu32, transaction->amount_vnd);
+        ESP_LOGI(TAG, "amount_vnd=%" PRIu64, transaction->amount_vnd);
         ESP_LOGI(TAG, "volume_ml=%" PRIu32, transaction->volume_ml);
         ESP_LOGE(
             TAG,
@@ -341,7 +403,7 @@ static transaction_report_result_t report_completed_transaction(
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "GIAO DICH BOM HOP LE - DA QUEUE MQTT TELEMETRY");
     ESP_LOGI(TAG, "unit_price=%" PRIu32, transaction->unit_price);
-    ESP_LOGI(TAG, "amount_vnd=%" PRIu32, transaction->amount_vnd);
+    ESP_LOGI(TAG, "amount_vnd=%" PRIu64, transaction->amount_vnd);
     ESP_LOGI(TAG, "volume_ml=%" PRIu32, transaction->volume_ml);
     ESP_LOGI(TAG, "ts=%" PRId64, time_snapshot.ts);
     ESP_LOGI(TAG, "time_device=%s", time_snapshot.time_device);
@@ -584,7 +646,7 @@ static void pump_transaction_filter_task(void *argument)
                     ESP_LOGW(
                         TAG,
                         "Mau duong dau tien trung man hinh truoc luc ve 0: "
-                        "amount=%" PRIu32 " volume=%" PRIu32
+                        "amount=%" PRIu64 " volume=%" PRIu32
                         ", tam coi la du lieu cu duoc khoi phuc",
                         transaction.amount_vnd,
                         transaction.volume_ml
@@ -592,7 +654,7 @@ static void pump_transaction_filter_task(void *argument)
                 } else if (!has_pre_start_transaction) {
                     ESP_LOGI(
                         TAG,
-                        "Nhan mau bom duong dau tien: amount=%" PRIu32
+                        "Nhan mau bom duong dau tien: amount=%" PRIu64
                         " volume=%" PRIu32
                         ", chua co man hinh truoc luc ve 0 nen cho buoc tang",
                         transaction.amount_vnd,
@@ -601,7 +663,7 @@ static void pump_transaction_filter_task(void *argument)
                 } else {
                     ESP_LOGI(
                         TAG,
-                        "Nhan mau bom duong dau tien moi: amount=%" PRIu32
+                        "Nhan mau bom duong dau tien moi: amount=%" PRIu64
                         " volume=%" PRIu32
                         ", cho on dinh hoac buoc tang tiep theo",
                         transaction.amount_vnd,
@@ -629,8 +691,8 @@ static void pump_transaction_filter_task(void *argument)
                 if (!progressive_increase_seen) {
                     ESP_LOGI(
                         TAG,
-                        "Da xac nhan du lieu bom tang dan: amount=%" PRIu32
-                        " -> %" PRIu32 ", volume=%" PRIu32 " -> %" PRIu32,
+                        "Da xac nhan du lieu bom tang dan: amount=%" PRIu64
+                        " -> %" PRIu64 ", volume=%" PRIu32 " -> %" PRIu32,
                         previous_positive_transaction.amount_vnd,
                         transaction.amount_vnd,
                         previous_positive_transaction.volume_ml,
@@ -642,7 +704,7 @@ static void pump_transaction_filter_task(void *argument)
                 ESP_LOGW(
                     TAG,
                     "Du lieu bom khong tang dan, dat lai baseline: "
-                    "amount=%" PRIu32 " volume=%" PRIu32,
+                    "amount=%" PRIu64 " volume=%" PRIu32,
                     transaction.amount_vnd,
                     transaction.volume_ml
                 );

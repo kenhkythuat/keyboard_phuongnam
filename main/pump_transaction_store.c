@@ -12,8 +12,9 @@
 #define STORE_NAMESPACE          "pump_tx"
 #define STORE_BLOB_KEY           "queue"
 #define STORE_MAGIC              0x50545851UL
-#define STORE_VERSION            3U
-#define STORE_PREVIOUS_VERSION   2U
+#define STORE_VERSION            4U
+#define STORE_PREVIOUS_VERSION   3U
+#define STORE_V2_VERSION         2U
 #define STORE_LEGACY_VERSION     1U
 #define STORE_MAX_TRANSACTIONS   32U
 
@@ -43,6 +44,21 @@ typedef struct {
     uint16_t count;
     pump_stored_transaction_v2_t transactions[STORE_MAX_TRANSACTIONS];
 } pump_store_blob_v2_t;
+
+typedef struct {
+    uint32_t amount_vnd;
+    uint32_t volume_ml;
+    uint32_t unit_price;
+    char command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U];
+    char command_value[PUMP_TRANSACTION_COMMAND_VALUE_MAX_LENGTH + 1U];
+} pump_stored_transaction_v3_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    pump_stored_transaction_v3_t transactions[STORE_MAX_TRANSACTIONS];
+} pump_store_blob_v3_t;
 
 typedef struct {
     uint32_t magic;
@@ -95,10 +111,28 @@ static bool current_store_is_valid(const pump_store_blob_t *store)
     return true;
 }
 
-static bool previous_store_is_valid(const pump_store_blob_v2_t *store)
+static bool previous_store_is_valid(const pump_store_blob_v3_t *store)
 {
     if (store->magic != STORE_MAGIC ||
         store->version != STORE_PREVIOUS_VERSION ||
+        store->count > STORE_MAX_TRANSACTIONS) {
+        return false;
+    }
+    for (uint16_t index = 0U; index < store->count; index++) {
+        if (!command_code_is_stored_valid(
+                store->transactions[index].command_code) ||
+            !command_value_is_stored_valid(
+                store->transactions[index].command_value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool v2_store_is_valid(const pump_store_blob_v2_t *store)
+{
+    if (store->magic != STORE_MAGIC ||
+        store->version != STORE_V2_VERSION ||
         store->count > STORE_MAX_TRANSACTIONS) {
         return false;
     }
@@ -159,7 +193,8 @@ esp_err_t pump_transaction_store_init(void)
 
     union {
         pump_store_blob_t current;
-        pump_store_blob_v2_t previous;
+        pump_store_blob_v3_t previous;
+        pump_store_blob_v2_t v2;
         pump_store_blob_v1_t legacy;
     } stored;
     memset(&stored, 0, sizeof(stored));
@@ -185,6 +220,31 @@ esp_err_t pump_transaction_store_init(void)
             strlcpy(s_store.transactions[index].command_code,
                     stored.previous.transactions[index].command_code,
                     sizeof(s_store.transactions[index].command_code));
+            strlcpy(s_store.transactions[index].command_value,
+                    stored.previous.transactions[index].command_value,
+                    sizeof(s_store.transactions[index].command_value));
+        }
+        err = commit_store();
+        if (err != ESP_OK) {
+            nvs_close(s_nvs_handle);
+            return err;
+        }
+        ESP_LOGI(TAG, "Da migrate %u giao dich NVS v3 sang v4",
+                 (unsigned)s_store.count);
+    } else if (err == ESP_OK && blob_size == sizeof(stored.v2) &&
+               v2_store_is_valid(&stored.v2)) {
+        reset_store();
+        s_store.count = stored.v2.count;
+        for (uint16_t index = 0U; index < s_store.count; index++) {
+            s_store.transactions[index].amount_vnd =
+                stored.v2.transactions[index].amount_vnd;
+            s_store.transactions[index].volume_ml =
+                stored.v2.transactions[index].volume_ml;
+            s_store.transactions[index].unit_price =
+                stored.v2.transactions[index].unit_price;
+            strlcpy(s_store.transactions[index].command_code,
+                    stored.v2.transactions[index].command_code,
+                    sizeof(s_store.transactions[index].command_code));
             resolve_command_value(&s_store.transactions[index]);
         }
         err = commit_store();
@@ -192,7 +252,7 @@ esp_err_t pump_transaction_store_init(void)
             nvs_close(s_nvs_handle);
             return err;
         }
-        ESP_LOGI(TAG, "Da migrate %u giao dich NVS v2 sang v3",
+        ESP_LOGI(TAG, "Da migrate %u giao dich NVS v2 sang v4",
                  (unsigned)s_store.count);
     } else if (err == ESP_OK && blob_size == sizeof(stored.legacy) &&
                legacy_store_is_valid(&stored.legacy)) {

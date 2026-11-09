@@ -542,6 +542,8 @@ static bool decode_total_amount_display(
         multiplier = 1U;
     } else if (dp_mask == ((1U << 0U) | (1U << 3U))) {
         multiplier = 10U;
+    } else if (dp_mask == ((1U << 1U) | (1U << 4U))) {
+        multiplier = 100U;
     } else if (dp_mask == 0U || dp_mask == (1U << 0U)) {
         multiplier = 10000U;
     } else {

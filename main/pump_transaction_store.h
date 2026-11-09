@@ -11,7 +11,7 @@
     CALIBRATION_RAW_COMMAND_MAX_LENGTH
 
 typedef struct {
-    uint32_t amount_vnd;
+    uint64_t amount_vnd;
     uint32_t volume_ml;
     uint32_t unit_price;
     char command_code[PUMP_TRANSACTION_COMMAND_CODE_MAX_LENGTH + 1U];

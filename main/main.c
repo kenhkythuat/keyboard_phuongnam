@@ -130,6 +130,7 @@ typedef enum {
 
 typedef struct {
     bool calibration_mismatch;
+    bool calibration_verification_failed;
     char expected_command_code[SHORTCUT_KEY_MAX_LENGTH + 1U];
     char expected_command_value[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
     char actual_command_value[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
@@ -995,7 +996,9 @@ static esp_err_t publish_boot_diagnostic_event(bool calibration_event,
     }
 
     const char *event_name = calibration_event ?
-        "calibration_mismatch" : "price_mismatch";
+        (s_boot_diagnostics.calibration_verification_failed ?
+            "calibration_verification_failed" : "calibration_mismatch") :
+        "price_mismatch";
     const char *severity = calibration_event ? "error" : "warning";
     bool built =
         cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
@@ -1010,6 +1013,9 @@ static esp_err_t publish_boot_diagnostic_event(bool calibration_event,
     bool data_attached = built && cJSON_AddItemToObject(root, "data", data);
 
     if (data_attached && calibration_event) {
+        const char *actual_command_value =
+            s_boot_diagnostics.actual_command_value[0] != '\0' ?
+                s_boot_diagnostics.actual_command_value : "unreadable";
         built =
             cJSON_AddStringToObject(data, "parameter",
                                    "mode_calibration") != NULL &&
@@ -1021,7 +1027,11 @@ static esp_err_t publish_boot_diagnostic_event(bool calibration_event,
                 s_boot_diagnostics.expected_command_value) != NULL &&
             cJSON_AddStringToObject(
                 data, "actual_command_value",
-                s_boot_diagnostics.actual_command_value) != NULL;
+                actual_command_value) != NULL;
+        if (built && s_boot_diagnostics.calibration_verification_failed) {
+            built = cJSON_AddStringToObject(
+                        data, "reason", "verification_failed") != NULL;
+        }
     } else if (data_attached) {
         built =
             cJSON_AddNumberToObject(
@@ -1052,7 +1062,7 @@ static esp_err_t publish_boot_diagnostic_event(bool calibration_event,
     }
     cJSON_Delete(root);
 
-    err = mqtt_manager_publish_event(payload);
+    err = mqtt_manager_publish_noti(payload);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Da queue boot diagnostic event=%s", event_name);
     }
@@ -1065,22 +1075,25 @@ static void boot_diagnostic_event_task(void *argument)
     uint32_t event_sequence = 1U;
 
     while (s_boot_diagnostics.calibration_mismatch ||
+           s_boot_diagnostics.calibration_verification_failed ||
            s_boot_diagnostics.price_mismatch) {
         if (!mqtt_manager_is_ready() || !time_manager_is_valid()) {
             vTaskDelay(pdMS_TO_TICKS(BOOT_DIAGNOSTIC_RETRY_MS));
             continue;
         }
 
-        if (s_boot_diagnostics.calibration_mismatch) {
+        if (s_boot_diagnostics.calibration_mismatch ||
+            s_boot_diagnostics.calibration_verification_failed) {
             esp_err_t err = publish_boot_diagnostic_event(true,
                                                           event_sequence);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Gui calibration_mismatch chua thanh cong: %s",
+                ESP_LOGW(TAG, "Gui boot calibration noti chua thanh cong: %s",
                          esp_err_to_name(err));
                 vTaskDelay(pdMS_TO_TICKS(BOOT_DIAGNOSTIC_RETRY_MS));
                 continue;
             }
             s_boot_diagnostics.calibration_mismatch = false;
+            s_boot_diagnostics.calibration_verification_failed = false;
             event_sequence++;
         }
 
@@ -1104,6 +1117,7 @@ static void boot_diagnostic_event_task(void *argument)
 static esp_err_t boot_diagnostic_event_start(void)
 {
     if (!s_boot_diagnostics.calibration_mismatch &&
+        !s_boot_diagnostics.calibration_verification_failed &&
         !s_boot_diagnostics.price_mismatch) {
         return ESP_OK;
     }
@@ -1616,19 +1630,27 @@ static esp_err_t reapply_calibration_mode_on_boot(void)
 
     ESP_LOGI(TAG, "Kiem tra mode boot %s voi raw_command=%s",
              mode, mapping.raw_command);
+    strlcpy(s_boot_diagnostics.expected_command_code, mode,
+            sizeof(s_boot_diagnostics.expected_command_code));
+    strlcpy(s_boot_diagnostics.expected_command_value,
+            mapping.raw_command,
+            sizeof(s_boot_diagnostics.expected_command_value));
+
     boot_calibration_check_t check = {0};
     err = mqtt_command_handler_check_boot_calibration(mapping.raw_command,
                                                        &check);
-    if (check.calibration_observed && check.calibration_mismatch) {
-        s_boot_diagnostics.calibration_mismatch = true;
-        strlcpy(s_boot_diagnostics.expected_command_code, mode,
-                sizeof(s_boot_diagnostics.expected_command_code));
-        strlcpy(s_boot_diagnostics.expected_command_value,
-                mapping.raw_command,
-                sizeof(s_boot_diagnostics.expected_command_value));
+    if (check.calibration_observed) {
         strlcpy(s_boot_diagnostics.actual_command_value,
                 check.actual_command_value,
                 sizeof(s_boot_diagnostics.actual_command_value));
+    }
+    if (check.calibration_mismatch) {
+        s_boot_diagnostics.calibration_mismatch = true;
+    }
+    if (err != ESP_OK) {
+        s_boot_diagnostics.calibration_verification_failed = true;
+        ESP_LOGW(TAG,
+                 "Se gui noti calibration_verification_failed khi MQTT/time ready");
     }
 
     if (price_result == ESP_OK && check.unit_price_observed &&
