@@ -37,6 +37,7 @@ Production cần chuyển sang TLS và không lưu secret trực tiếp trong re
 | `tbmq/keyboard/<node_id>/command` | Server | Node | 1 | false |
 | `tbmq/keyboard/<node_id>/ack` | Node | Server | 1 | false |
 | `tbmq/keyboard/<node_id>/event` | Node | Server | 1 | false |
+| `tbmq/keyboard/<node_id>/noti` | Node | Server | 1 | false |
 
 Node không subscribe wildcard. `MQTT_READY` chỉ được set sau khi broker xác nhận subscribe command topic.
 
@@ -101,37 +102,153 @@ Các `result` hiện dùng: `ok`, `error`, `rejected`.
 | `reported_mismatch` | Readback mapping khác dữ liệu yêu cầu |
 | `mapping_limit_reached` | Không còn vị trí mapping |
 
+Ví dụ ACK lỗi param; các ACK lỗi command cụ thể giữ nguyên envelope này và chỉ
+thay `ack_to`, `description` theo bảng/luồng tương ứng:
+
+```json
+{
+  "ts": 1794000002,
+  "version": "1.3",
+  "request_id": "cmd-unit-price-invalid-001",
+  "ack_to": "set_unit_price",
+  "result": "error",
+  "description": "invalid_param",
+  "reported": {},
+  "time_device": "07/11/2026 10:00:02"
+}
+```
+
+Request trùng `request_id` đã được xử lý trả `result=rejected`,
+`description=duplicate_request` và `reported: {}`.
+
 ## 6. Command đã hỗ trợ
+
+Tất cả ví dụ trong mục này dùng hai topic sau, với `node_kbd_029` chỉ là Node
+mẫu:
+
+```text
+Server -> Node: tbmq/keyboard/node_kbd_029/command
+Node -> Server: tbmq/keyboard/node_kbd_029/ack
+```
+
+`request_id` trong ACK phải giữ nguyên tuyệt đối từ command và `ack_to` phải
+bằng đúng `cmd`. Các giá trị `ts` và `time_device` trong ACK dưới đây chỉ là ví
+dụ; firmware lấy cả hai từ cùng một snapshot của `time_manager`.
 
 ### 6.1 `set_hash_key_lock`
 
+Command server gửi:
+
 ```json
-{"param":{"locked":true}}
+{
+  "ts": 1794000000,
+  "version": "1.3",
+  "request_id": "cmd-hash-lock-001",
+  "cmd": "set_hash_key_lock",
+  "param": {
+    "locked": true
+  }
+}
+```
+
+ACK thành công:
+
+```json
+{
+  "ts": 1794000001,
+  "version": "1.3",
+  "request_id": "cmd-hash-lock-001",
+  "ack_to": "set_hash_key_lock",
+  "result": "ok",
+  "description": "hash_key_lock_updated",
+  "reported": {
+    "hash_key_locked": true
+  },
+  "time_device": "07/11/2026 10:00:01"
+}
 ```
 
 - Lưu NVS `device_cfg/hash_lock`.
 - `true`: bỏ qua phím `#` vật lý; phím ảo vẫn hoạt động.
 - ACK thành công: `hash_key_lock_updated`, reported `hash_key_locked`.
+- ACK lỗi: `error/invalid_param`, `error/storage_error` hoặc
+  `error/verification_failed`.
 
 ### 6.2 `set_price_edit_lock`
 
+Command server gửi:
+
 ```json
-{"param":{"locked":true}}
+{
+  "ts": 1794000010,
+  "version": "1.3",
+  "request_id": "cmd-price-lock-001",
+  "cmd": "set_price_edit_lock",
+  "param": {
+    "locked": true
+  }
+}
+```
+
+ACK thành công:
+
+```json
+{
+  "ts": 1794000011,
+  "version": "1.3",
+  "request_id": "cmd-price-lock-001",
+  "ack_to": "set_price_edit_lock",
+  "result": "ok",
+  "description": "price_edit_lock_updated",
+  "reported": {
+    "price_edit_locked": true
+  },
+  "time_device": "07/11/2026 10:00:11"
+}
 ```
 
 - Lưu NVS `device_cfg/price_lock` và readback trước khi ACK `ok`.
 - Chưa nối vào logic khóa thao tác đổi giá.
 - Giữ trạng thái qua reboot và OTA app.
 - ACK thành công: `price_edit_lock_updated`, reported `price_edit_locked`.
+- ACK lỗi: `error/invalid_param`, `error/storage_error` hoặc
+  `error/verification_failed`.
 
 ### 6.3 `set_unit_price`
 
+Command server gửi:
+
 ```json
-{"param":{"unit_price":31000}}
+{
+  "ts": 1794000020,
+  "version": "1.3",
+  "request_id": "cmd-unit-price-001",
+  "cmd": "set_unit_price",
+  "param": {
+    "unit_price": 31000
+  }
+}
+```
+
+ACK thành công sau khi LED readback đúng:
+
+```json
+{
+  "ts": 1794000028,
+  "version": "1.3",
+  "request_id": "cmd-unit-price-001",
+  "ack_to": "set_unit_price",
+  "result": "ok",
+  "description": "unit_price_updated",
+  "reported": {
+    "unit_price": 31000
+  },
+  "time_device": "07/11/2026 10:00:28"
+}
 ```
 
 - Khoảng hợp lệ: 1..999999, integer.
-- Chuỗi phím: `C#44504EP` + giá + `E`.
+- Chuỗi phím: function key hiệu lực slot 3 (mặc định `C#44504EP`) + giá + `E`.
 - Xác nhận LED: hàng 1 là `E0`, hàng 3 đúng giá.
 - Retry toàn bộ tối đa 3 lần; mỗi lần retry bắt đầu bằng `C`.
 - Kết thúc thành công hoặc thất bại đều gửi `CC` để thoát.
@@ -140,21 +257,57 @@ Các `result` hiện dùng: `ok`, `error`, `rejected`.
   `description=verification_failed`.
 - Mỗi phím giữ `AUTO_KEY_HOLD_TIME_MS=60 ms`; khoảng nghỉ giữa hai phím
   của command là `VIRTUAL_KEY_INTERVAL_MS=60 ms`.
+- ACK lỗi param dùng `error/invalid_param`; verify LED thất bại dùng
+  `error/verification_failed` và `reported` rỗng.
 
 ### 6.4 `get_totalizer`
 
 `param` phải rỗng.
 
+Command server gửi:
+
+```json
+{
+  "ts": 1794000030,
+  "version": "1.3",
+  "request_id": "cmd-get-totalizer-001",
+  "cmd": "get_totalizer",
+  "param": {}
+}
+```
+
+ACK thành công:
+
+```json
+{
+  "ts": 1794000040,
+  "version": "1.3",
+  "request_id": "cmd-get-totalizer-001",
+  "ack_to": "get_totalizer",
+  "result": "ok",
+  "description": "totalizer_read_success",
+  "reported": {
+    "total_amount_vnd": 10862100,
+    "total_volume_l": 273.6
+  },
+  "time_device": "07/11/2026 10:00:40"
+}
+```
+
+Nếu không xác nhận được một trong hai tổng sau các lần retry, ACK là
+`error/verification_failed` với `reported: {}`. Param không rỗng trả
+`error/invalid_param`.
+
 Luồng tổng tiền:
 
 ```text
-C#7733 -> E -> chờ P20 -> decode hàng 2 -> C
+function key slot 1, tách E cuối -> E -> chờ P20 -> decode hàng 2 -> C
 ```
 
 Luồng tổng lít:
 
 ```text
-C#44504ET -> chờ 1 giây -> decode màn hình -> C
+function key slot 2 -> chờ 1 giây -> decode màn hình -> C
 ```
 
 Mỗi phần retry tối đa 3 lần. Cả hai thành công mới:
@@ -166,7 +319,7 @@ Mỗi phần retry tối đa 3 lần. Cả hai thành công mới:
 
 Implementation dùng `read_total_amount()` và chỉ chấp nhận snapshot LED mới:
 
-1. Gửi `C#7733`.
+1. Đọc function key slot 1 (mặc định `C#7733E`) và gửi phần trước `E` cuối.
 2. Chờ một khoảng phím, lưu `baseline_generation` của LED decoder.
 3. Gửi `E`.
 4. Poll snapshot mỗi 50 ms, tối đa 3000 ms.
@@ -222,7 +375,7 @@ Cả mẫu không DP và mẫu chỉ có DP cột 1 đều được giải mã t
 
 Implementation dùng `read_total_volume()`:
 
-1. Lưu generation hiện tại rồi gửi `C#44504ET`.
+1. Lưu generation hiện tại rồi gửi function key slot 2 (mặc định `C#44504ET`).
 2. Chờ `TOTALIZER_DISPLAY_SETTLE_MS=1000 ms` để màn hình ổn định.
 3. Poll snapshot mới mỗi 50 ms, tối đa 3000 ms.
 4. Giải mã toàn bộ chữ số hợp lệ ở hàng 1 thành phần nguyên.
@@ -303,7 +456,7 @@ giữ nguyên luồng riêng.
 ```json
 {
   "ts": 1793933258,
-  "version": "1.3",
+  "version": "1.8",
   "event_id": "evt-node_kbd_029-1793933258",
   "event": "close_shif",
   "source": "device",
@@ -332,21 +485,82 @@ timestamp giả và không làm tắt LED.
 
 `param` phải rỗng. Reuse `read_totalizer()` giống `get_totalizer` nhưng chỉ ACK:
 
+Command server gửi:
+
+```json
+{
+  "ts": 1794000100,
+  "version": "1.3",
+  "request_id": "cmd-close-shift-001",
+  "cmd": "close_shift",
+  "param": {}
+}
+```
+
+ACK thành công:
+
+```json
+{
+  "ts": 1794000110,
+  "version": "1.3",
+  "request_id": "cmd-close-shift-001",
+  "ack_to": "close_shift",
+  "result": "ok",
+  "description": "shift_closed",
+  "reported": {
+    "total_amount_vnd": 10862100,
+    "total_volume_l": 273.6
+  },
+  "time_device": "07/11/2026 10:01:50"
+}
+```
+
 - description `shift_closed`;
 - reported có `total_amount_vnd`, `total_volume_l`.
+- Đọc tổng thất bại trả `error/verification_failed`; param không rỗng trả
+  `error/invalid_param`.
 
 Backend chịu trách nhiệm bảo đảm chốt ca đúng một lần.
 
 ### 6.6 `reset_totalizer`
 
+Command server gửi:
+
 ```json
-{"param":{"confirm":true}}
+{
+  "ts": 1794000120,
+  "version": "1.3",
+  "request_id": "cmd-reset-totalizer-001",
+  "cmd": "reset_totalizer",
+  "param": {
+    "confirm": true
+  }
+}
+```
+
+ACK thành công sau khi cả hai tổng đã được readback bằng 0:
+
+```json
+{
+  "ts": 1794000140,
+  "version": "1.3",
+  "request_id": "cmd-reset-totalizer-001",
+  "ack_to": "reset_totalizer",
+  "result": "ok",
+  "description": "totalizer_reset",
+  "reported": {
+    "total_amount_vnd": 0,
+    "total_volume_l": 0
+  },
+  "time_device": "07/11/2026 10:02:20"
+}
 ```
 
 Tổng tiền:
 
 ```text
-C#7733 -> E -> verify P20 -> 000 -> verify E0 -> C
+function key slot 4, tách hậu tố E000C -> E -> verify P20
+-> 000 -> verify E0 -> C
 ```
 
 Tổng lít:
@@ -357,6 +571,8 @@ C#845443E -> verify P08 -> 0 -> verify hàng 2 = 0
 ```
 
 Mỗi phần retry 3 lần. ACK `totalizer_reset` chỉ khi cả hai thành công, reported bằng 0.
+Thiếu `confirm:true`, có field param thừa hoặc sai kiểu trả
+`error/invalid_param`; readback thất bại trả `error/verification_failed`.
 
 ### 6.7 `set_shortcut_mapping`
 
@@ -369,9 +585,35 @@ Slot 10 is reserved for the local Totalizer view shortcut. Only
 
 ```json
 {
+  "ts": 1794000145,
+  "version": "1.3",
+  "request_id": "cmd-totalizer-shortcut-001",
+  "cmd": "set_shortcut_mapping",
   "param": {
     "shortcut_key_10": "P9E"
   }
+}
+```
+
+ACK slot 10 vẫn dùng cùng contract với slot 1-9. Khi server không gửi
+`physical_key_10`, readback hiện trả giá trị tương thích mặc định `P88`:
+
+```json
+{
+  "ts": 1794000146,
+  "version": "1.3",
+  "request_id": "cmd-totalizer-shortcut-001",
+  "ack_to": "set_shortcut_mapping",
+  "result": "ok",
+  "description": "shortcut_mapping_updated",
+  "reported": {
+    "mapping": {
+      "physical_key": "P88",
+      "shortcut_key": "P9E"
+    },
+    "revision": 4
+  },
+  "time_device": "07/11/2026 10:02:26"
 }
 ```
 
@@ -387,12 +629,39 @@ The successful ACK uses the same schema as slots 1-9 and reports both
 
 Mỗi command cập nhật đúng một slot từ 1 đến 10:
 
+Command server gửi cho slot thường 1-9:
+
 ```json
 {
+  "ts": 1794000150,
+  "version": "1.3",
+  "request_id": "cmd-shortcut-001",
+  "cmd": "set_shortcut_mapping",
   "param": {
     "physical_key_1": "C#7733E",
     "shortcut_key_1": "P123"
   }
+}
+```
+
+ACK thành công sau khi ghi và readback NVS:
+
+```json
+{
+  "ts": 1794000151,
+  "version": "1.3",
+  "request_id": "cmd-shortcut-001",
+  "ack_to": "set_shortcut_mapping",
+  "result": "ok",
+  "description": "shortcut_mapping_updated",
+  "reported": {
+    "mapping": {
+      "physical_key": "C#7733E",
+      "shortcut_key": "P123"
+    },
+    "revision": 5
+  },
+  "time_device": "07/11/2026 10:02:31"
 }
 ```
 
@@ -403,15 +672,89 @@ Mỗi command cập nhật đúng một slot từ 1 đến 10:
 - Không cho trùng shortcut ở slot khác.
 - Ghi NVS, readback và kiểm tra revision trước ACK.
 - ACK `shortcut_mapping_updated`, reported chứa `mapping` và `revision`.
+- ACK lỗi có thể là `invalid_param`, `mapping_limit_reached`,
+  `reported_mismatch`, `storage_error` hoặc `internal_error`; `result` là
+  `error` và `reported` rỗng.
 
 Khi người dùng nhập shortcut vật lý, sequence output được đưa qua queue. Phím ảo không đi lại qua bộ nhận dạng shortcut nên không tạo vòng lặp.
+
+### 6.7.1 `set_function_key_config`
+
+Command này cấu hình chuỗi phím hệ thống, độc lập với bảng shortcut vật lý ở
+mục 6.7. Bảng có 10 slot; 5 slot đầu đã được gắn vào runtime:
+
+| Slot | Chức năng | Factory key |
+|---:|---|---|
+| 1 | Đọc tổng tiền | `C#7733E` |
+| 2 | Xem tổng lít | `C#44504ET` |
+| 3 | Tiền tố đổi đơn giá | `C#44504EP` |
+| 4 | Xóa tổng tiền | `C#7733E000C` |
+| 5 | Vào calibration | `C#122973E` |
+| 6-10 | Dự phòng | Chưa gắn chức năng runtime |
+
+Ví dụ đổi chuỗi đọc tổng tiền ở slot 1:
+
+```json
+{
+  "ts": 1794000150,
+  "version": "1.3",
+  "request_id": "cmd-function-key-config-001",
+  "cmd": "set_function_key_config",
+  "param": {
+    "factory_key_1": "C#7733E",
+    "edited_key_1": "C#8833E"
+  }
+}
+```
+
+ACK chỉ được gửi `ok` sau khi ghi NVS và readback đúng:
+
+```json
+{
+  "ts": 1794000151,
+  "version": "1.3",
+  "request_id": "cmd-function-key-config-001",
+  "ack_to": "set_function_key_config",
+  "result": "ok",
+  "description": "function_key_updated",
+  "reported": {
+    "mapping": {
+      "factory_key_1": "C#7733E",
+      "edited_key_1": "C#8833E"
+    },
+    "revision": 1
+  },
+  "time_device": "07/11/2026 10:02:31"
+}
+```
+
+- Hai field phải cùng suffix từ 1 đến 10 và `param` không được có field thừa.
+- Slot 1-5 yêu cầu `factory_key_N` đúng factory key đã biên dịch; field này xác
+  định slot chứ không thay đổi factory key.
+- Khi chưa có cấu hình NVS, `edited_key` của slot 1-5 được seed bằng factory
+  key nên hành vi cũ được giữ nguyên.
+- Mỗi thay đổi thực sự tăng `revision`; gửi lại cùng giá trị không tăng revision.
+- Slot 1 giữ ký tự `E` cuối để firmware chụp generation trước khi bấm `E` và
+  verify `P20`.
+- Slot 4 bắt buộc kết thúc bằng `E000C`. Firmware vẫn thực hiện theo từng bước:
+  phần tiền tố -> `E` -> verify `P20` -> `000` -> verify `E0` -> `C`.
+- Slot 6-10 có thể được lưu trước cho mở rộng, nhưng hiện chưa được gọi bởi
+  chức năng runtime.
+- Param sai trả `error/invalid_param`; ghi NVS lỗi trả `error/storage_error`;
+  readback sai trả `error/verification_failed`.
 
 ### 6.8 `send_calibration_command`
 
 Mỗi command cập nhật một slot từ 1 đến 5:
 
+Command server gửi:
+
 ```json
 {
+  "ts": 1794000160,
+  "version": "1.3",
+  "request_id": "cmd-calibration-001",
+  "cmd": "send_calibration_command",
   "param": {
     "name_3": "P555",
     "raw_command_3": "2530"
@@ -419,9 +762,28 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 }
 ```
 
+ACK thành công chỉ sau khi calibration và NVS readback đều đúng:
+
+```json
+{
+  "ts": 1794000170,
+  "version": "1.3",
+  "request_id": "cmd-calibration-001",
+  "ack_to": "send_calibration_command",
+  "result": "ok",
+  "description": "calibration_command_applied",
+  "reported": {
+    "name": "P555",
+    "command_echo": "2530",
+    "mode_calibration": "P555"
+  },
+  "time_device": "07/11/2026 10:02:50"
+}
+```
+
 - `name`: shortcut hợp lệ, tối đa 16 ký tự.
 - `raw_command`: chỉ số, dài 1..6.
-- Gửi `C#122973E`, verify `P06`.
+- Gửi function key hiệu lực của slot 5 (mặc định `C#122973E`), verify `P06`.
 - Chờ `CALIBRATION_RAW_COMMAND_DELAY_MS=50 ms` rồi nhập raw command.
 - Verify hàng 2 đúng raw command.
 - Gửi `E`, verify hàng 1 `E0` và hàng 2 vẫn đúng.
@@ -430,19 +792,65 @@ Mỗi command cập nhật một slot từ 1 đến 5:
 - Calibration shortcut local chỉ thực hiện đúng 1 lần, không retry.
 - Chỉ sau verify thành công mới lưu mapping và `mode_calibration=name`.
 - ACK `calibration_command_applied`, reported gồm `name`, `command_echo`, `mode_calibration`.
+- Param sai trả `error/invalid_param`; thao tác LED/readback sai trả
+  `error/verification_failed`; ghi NVS lỗi trả `error/storage_error`.
 
-Khi boot, firmware không ghi calibration lại ngay. Nó phát `C#122973E`, chờ
+Khi boot, firmware không ghi calibration lại ngay. Nó phát function key hiệu
+lực của slot 5 (mặc định `C#122973E`), chờ
 frame mới có `P06`, đọc hàng 2 và so sánh với `raw_command` của
 `mode_calibration` trong NVS. DP định dạng trên hàng 2 được bỏ qua khi so sánh.
 Nếu hai giá trị bằng nhau, firmware gửi `C` để thoát. Nếu khác, firmware ghi
-nhận event pending `calibration_mismatch`, áp dụng lại raw command và verify
+nhận noti pending `calibration_mismatch`, áp dụng lại raw command và verify
 `E0` như flow calibration bình thường.
 
 Sau khi thoát, hai frame hàng 3 liên tiếp phải decode ra cùng một giá trước khi
-so sánh với `last_unit_price` trong NVS. Giá khác nhau tạo event pending
+so sánh với `last_unit_price` trong NVS. Giá khác nhau tạo noti pending
 `price_mismatch`. Hai thông báo được publish lên topic `noti` sau khi MQTT
 ready và SNTP hợp lệ;
 không có giá NVS hoặc không decode được hàng 3 thì chỉ log, không báo mismatch.
+
+Hai thông báo boot là dữ liệu Node chủ động publish, không phải ACK command và
+server không gửi command để kích hoạt trực tiếp. Ví dụ calibration mismatch:
+
+```json
+{
+  "ts": 1794000180,
+  "version": "1.8",
+  "event_id": "evt-node_kbd_029-1794000180-000001",
+  "event": "calibration_mismatch",
+  "source": "device",
+  "trigger": "system",
+  "severity": "error",
+  "status": "active",
+  "data": {
+    "parameter": "mode_calibration",
+    "expected_command_code": "P555",
+    "expected_command_value": "2530",
+    "actual_command_value": "2500"
+  },
+  "time_device": "07/11/2026 10:03:00"
+}
+```
+
+Ví dụ giá đọc từ LED khác giá lưu trong NVS:
+
+```json
+{
+  "ts": 1794000181,
+  "version": "1.8",
+  "event_id": "evt-node_kbd_029-1794000181-000002",
+  "event": "price_mismatch",
+  "source": "device",
+  "trigger": "system",
+  "severity": "warning",
+  "status": "active",
+  "data": {
+    "expected_price_vnd": 25000,
+    "actual_price_vnd": 24500
+  },
+  "time_device": "07/11/2026 10:03:01"
+}
+```
 
 Slot 1 là mode calibration tạm thời. Nếu thiết bị đang ở mode thuộc slot 2-5
 rồi nhận và áp dụng thành công `name_1/raw_command_1`, firmware lưu mode cũ
@@ -482,10 +890,27 @@ ghi đè; nếu trạng thái Wi-Fi xuất hiện trong thời gian hiển thị
 }
 ```
 
+ACK cho biết request đã được đưa vào OTA worker, chưa có nghĩa firmware mới đã
+được tải và xác nhận thành công:
+
+```json
+{
+  "ts": 1794000201,
+  "version": "1.3",
+  "request_id": "cmd-ota-001",
+  "ack_to": "OTA",
+  "result": "ok",
+  "description": "ota_accepted",
+  "reported": {},
+  "time_device": "07/11/2026 10:03:21"
+}
+```
+
 - Command name phân biệt hoa/thường và phải đúng `OTA`.
 - Handler đưa request vào queue rồi ACK `ok/ota_accepted`; không tải firmware trong MQTT callback/task.
 - Nếu đã có OTA chạy hoặc chờ: ACK `rejected/busy`.
 - Payload sai hoặc `param` không rỗng: ACK `error/invalid_param`.
+- OTA worker đang bận: ACK `rejected/busy` với `reported: {}`.
 - Manifest: `OTA/version.json`, bắt buộc có `version` và `firmware_url`.
 - Chỉ tải khi remote semantic version lớn hơn `PROJECT_VER` hiện tại.
 - Image phải có cùng `project_name` và app version phải đúng version manifest.
@@ -506,6 +931,8 @@ Rollback được bật bằng `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. Firmware
 
 ### 6.10 `set_mqtt_config`
 
+Command server gửi:
+
 ```json
 {
   "ts": 1791007000,
@@ -521,6 +948,29 @@ Rollback được bật bằng `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. Firmware
 }
 ```
 
+ACK khi cấu hình khác hiện tại và đã được stage vào NVS:
+
+```json
+{
+  "ts": 1791007001,
+  "version": "1.3",
+  "request_id": "cmd-mqtt-config-001",
+  "ack_to": "set_mqtt_config",
+  "result": "ok",
+  "description": "mqtt_config_staged",
+  "reported": {
+    "mqtt_broker_host": "161.248.146.170",
+    "mqtt_broker_port": 1883,
+    "mqtt_username": "node_user",
+    "password_configured": true
+  },
+  "time_device": "30/09/2026 18:36:41"
+}
+```
+
+Nếu bốn giá trị giống cấu hình đang chạy, ACK có cùng `reported` nhưng
+`description=mqtt_config_unchanged` và thiết bị không reboot.
+
 - Host không chứa scheme như `mqtt://`; port phải trong `1..65535`.
 - Password không được ghi ra log hoặc trả lại trong ACK.
 - Nếu cấu hình không đổi: ACK `ok/mqtt_config_unchanged`, không reboot.
@@ -531,6 +981,9 @@ Rollback được bật bằng `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. Firmware
 - Nếu broker không ready trong 60 giây hoặc từ chối xác thực, firmware phục hồi
   cấu hình cũ và reboot.
 - ACK `reported` chỉ chứa host, port, username và `password_configured=true`.
+- Param sai trả `error/invalid_param`; đang có trial khác trả `error/busy`;
+  lỗi NVS trả `error/storage_error`; không đọc được core config trả
+  `error/internal_error`.
 
 ## 7. Command khai báo nhưng chưa triển khai
 
@@ -542,9 +995,39 @@ Các tên sau xuất hiện trong danh sách command nhưng chưa có handler:
 
 Chúng hiện trả `result=rejected`, `description=unsupported_command`.
 
+Ví dụ server gửi một command chưa hỗ trợ:
+
+```json
+{
+  "ts": 1794000300,
+  "version": "1.3",
+  "request_id": "cmd-unsupported-001",
+  "cmd": "get_reported_state",
+  "param": {}
+}
+```
+
+ACK:
+
+```json
+{
+  "ts": 1794000301,
+  "version": "1.3",
+  "request_id": "cmd-unsupported-001",
+  "ack_to": "get_reported_state",
+  "result": "rejected",
+  "description": "unsupported_command",
+  "reported": {},
+  "time_device": "07/11/2026 10:05:01"
+}
+```
+
 ## 8. Transaction telemetry
 
 Topic: `tbmq/keyboard/<node_id>/telemetry`.
+
+Đây là dữ liệu Node chủ động gửi khi giao dịch bơm hoàn tất, không phải command
+từ server và không có ACK MQTT tương ứng. Payload publish mẫu nằm bên dưới.
 
 ### Giải mã `amount_vnd` từ hàng 1
 
@@ -611,14 +1094,18 @@ Validation trước publish:
 
 Nếu chưa đủ điều kiện mạng/time, lưu tối đa 32 giao dịch vào NVS. Bản ghi giữ
 cả `command_code` và `command_value` gốc nhưng hiện chưa giữ timestamp gốc;
-thời gian được lấy lúc gửi lại. Queue giao dịch dùng schema version 3. Khi boot
-firmware migrate schema version 2 bằng cách giữ `command_code` và tra mapping
-NVS hiện có để bổ sung `command_value`; schema version 1 dùng mode mặc định rồi
-thực hiện cùng phép tra.
+thời gian được lấy lúc gửi lại. Queue giao dịch dùng schema version 4 với
+`amount_vnd` 64-bit. Khi boot, firmware migrate schema version 3 bằng cách giữ
+nguyên `command_code`/`command_value` và mở rộng `amount_vnd`; schema version 2
+giữ `command_code` rồi tra mapping NVS để bổ sung `command_value`; schema version
+1 dùng mode mặc định rồi thực hiện cùng phép tra.
 
 ## 9. Totalizer telemetry
 
 Được gửi sau `get_totalizer` thành công:
+
+Command và ACK tương ứng xem mục 6.4. Telemetry dưới đây là message thứ hai do
+Node chủ động publish sau ACK; server không ACK lại telemetry này.
 
 ```json
 {
@@ -635,6 +1122,9 @@ thực hiện cùng phép tra.
 ## 10. Heartbeat telemetry
 
 Chu kỳ 60 giây:
+
+Heartbeat không cần command kích hoạt và không có ACK từ firmware. Server theo
+dõi trực tiếp payload trên topic telemetry.
 
 ```json
 {
@@ -666,6 +1156,9 @@ hoặc khi `set_unit_price` verify thành công. NVS chỉ được ghi khi giá
 
 Giữ IO0 active-low 7 giây, debounce 50 ms. Firmware mở AP từ `WIFI_CONFIG_AP_SSID`, tối đa 4 client, channel 1.
 
+Tính năng này được kích hoạt bằng nút IO0 và HTTP, không nhận MQTT command và
+không publish ACK MQTT. Kết quả lưu/kết nối được đọc qua endpoint `/status`.
+
 | Method | Endpoint | Chức năng |
 |---|---|---|
 | GET | `/` | Form nhập SSID/password |
@@ -676,12 +1169,16 @@ SSID tối đa 32 byte; password tối đa 64 byte ở form. Credential cũ ch�
 
 ## 12. Time manager
 
+- Module nội bộ, không có command/ACK MQTT riêng.
 - SNTP non-blocking, server `pool.ntp.org`.
 - Sync khi STA có IP và re-sync mỗi giờ.
 - TZ chuẩn qua `localtime_r()`, không cộng 7 thủ công.
 - `time_manager_get_snapshot()` là API nên dùng khi một payload cần cả `ts` và `time_device`.
 
 ## 13. NVS layout logic
+
+Đây là persistence nội bộ. Không có command NVS chung; từng command ở mục 6
+chịu trách nhiệm ghi, readback rồi ACK theo schema của chính command đó.
 
 | Namespace/key | Kiểu | Giới hạn |
 |---|---|---|
@@ -694,6 +1191,7 @@ SSID tối đa 32 byte; password tối đa 64 byte ở form. Credential cũ ch�
 | `device_cfg/cal_restore` | versioned blob | mode tạm và mode cần hoàn nguyên |
 | `device_cfg/shortcuts` | versioned blob | 10 slot + revision |
 | `device_cfg/calib_map` | versioned blob | 5 slot |
+| `device_cfg/function_keys` | versioned blob | 10 slot + revision; slot 1-5 có factory mặc định |
 | `device_cfg/mqtt_trial` | versioned blob | candidate + cấu hình MQTT cũ khi thử đổi broker |
 | `pump_tx/queue` | versioned blob | 32 giao dịch |
 
@@ -708,6 +1206,9 @@ Quy trình xuất xưởng:
 5. Reboot hoặc OTA app load lại NVS; factory seed mới trong binary không ghi đè cấu hình đã provision.
 
 ## 14. Phát hành OTA
+
+Command và ACK OTA runtime xem mục 6.9. Mục này chỉ mô tả thao tác chuẩn bị
+artifact ở phía phát hành firmware, không tạo thêm MQTT message.
 
 1. Tăng `PROJECT_VER` trong root `CMakeLists.txt`.
 2. Chạy `idf.py build`.

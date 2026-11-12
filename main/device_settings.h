@@ -13,6 +13,18 @@
 #define SHORTCUT_PHYSICAL_KEY_MAX_LENGTH    32U
 #define CALIBRATION_MAPPING_MAX_COUNT       5U
 #define CALIBRATION_RAW_COMMAND_MAX_LENGTH  6U
+#define FUNCTION_KEY_CONFIG_MAX_COUNT       10U
+#define FUNCTION_KEY_MAX_LENGTH             32U
+#define FUNCTION_KEY_SLOT_TOTAL_AMOUNT      1U
+#define FUNCTION_KEY_SLOT_TOTAL_VOLUME      2U
+#define FUNCTION_KEY_SLOT_UNIT_PRICE        3U
+#define FUNCTION_KEY_SLOT_RESET_AMOUNT      4U
+#define FUNCTION_KEY_SLOT_CALIBRATION       5U
+#define FUNCTION_KEY_FACTORY_TOTAL_AMOUNT   "C#7733E"
+#define FUNCTION_KEY_FACTORY_TOTAL_VOLUME   "C#44504ET"
+#define FUNCTION_KEY_FACTORY_UNIT_PRICE     "C#44504EP"
+#define FUNCTION_KEY_FACTORY_RESET_AMOUNT   "C#7733E000C"
+#define FUNCTION_KEY_FACTORY_CALIBRATION    "C#122973E"
 #define DEVICE_NODE_ID_MAX_LENGTH           12U
 #define DEVICE_MQTT_HOST_MAX_LENGTH         128U
 #define DEVICE_MQTT_USERNAME_MAX_LENGTH     64U
@@ -35,6 +47,11 @@ typedef struct {
     char name[SHORTCUT_KEY_MAX_LENGTH + 1U];
     char raw_command[CALIBRATION_RAW_COMMAND_MAX_LENGTH + 1U];
 } calibration_mapping_t;
+
+typedef struct {
+    char factory_key[FUNCTION_KEY_MAX_LENGTH + 1U];
+    char edited_key[FUNCTION_KEY_MAX_LENGTH + 1U];
+} function_key_config_t;
 
 typedef struct {
     char temporary_mode[SHORTCUT_KEY_MAX_LENGTH + 1U];
@@ -101,3 +118,18 @@ esp_err_t device_settings_find_calibration_by_name(
 bool device_settings_find_calibration_suffix(
     const char *input,
     calibration_mapping_t *mapping);
+bool device_settings_function_key_config_is_valid(uint8_t slot,
+                                                  const char *factory_key,
+                                                  const char *edited_key);
+esp_err_t device_settings_set_function_key_config_at(
+    uint8_t slot,
+    const char *factory_key,
+    const char *edited_key,
+    uint32_t *revision);
+esp_err_t device_settings_get_function_key_config_at(
+    uint8_t slot,
+    function_key_config_t *config,
+    uint32_t *revision);
+esp_err_t device_settings_get_effective_function_key(uint8_t slot,
+                                                     char *key,
+                                                     size_t size);

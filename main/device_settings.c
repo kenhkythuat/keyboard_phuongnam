@@ -19,6 +19,7 @@
 #define MODE_RESTORE_KEY         "cal_restore"
 #define SHORTCUT_MAPPING_KEY     "shortcuts"
 #define CALIBRATION_MAPPING_KEY  "calib_map"
+#define FUNCTION_KEY_CONFIG_KEY  "function_keys"
 #define CORE_CONFIG_KEY          "core_cfg"
 #define MQTT_CONFIG_TRIAL_KEY    "mqtt_trial"
 #define CORE_CONFIG_MAGIC        0x434F5245UL
@@ -31,6 +32,8 @@
 #define CALIBRATION_STORE_MAGIC  0x43414C42UL
 #define CALIBRATION_STORE_VERSION 2U
 #define CALIBRATION_STORE_LEGACY_VERSION 1U
+#define FUNCTION_KEY_STORE_MAGIC 0x464B4559UL
+#define FUNCTION_KEY_STORE_VERSION 1U
 #define CALIBRATION_STORAGE_SLOT_COUNT 10U
 #define MODE_RESTORE_MAGIC       0x4D525354UL
 #define MODE_RESTORE_VERSION     1U
@@ -51,6 +54,14 @@ typedef struct {
     /* Keep the legacy blob size so existing NVS data can be migrated. */
     calibration_mapping_t mappings[CALIBRATION_STORAGE_SLOT_COUNT];
 } calibration_store_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    uint32_t revision;
+    function_key_config_t configs[FUNCTION_KEY_CONFIG_MAX_COUNT];
+} function_key_store_t;
 
 typedef struct {
     uint32_t magic;
@@ -91,8 +102,10 @@ static char s_mode_calibration[SHORTCUT_KEY_MAX_LENGTH + 1U];
 static bool s_initialized;
 static shortcut_store_t s_shortcut_store;
 static calibration_store_t s_calibration_store;
+static function_key_store_t s_function_key_store;
 static portMUX_TYPE s_shortcut_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_function_key_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_mode_calibration_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_core_config_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -268,6 +281,37 @@ static void reset_calibration_store(calibration_store_t *store)
     store->version = CALIBRATION_STORE_VERSION;
 }
 
+static const char *factory_function_key(uint8_t slot)
+{
+    static const char *const defaults[] = {
+        FUNCTION_KEY_FACTORY_TOTAL_AMOUNT,
+        FUNCTION_KEY_FACTORY_TOTAL_VOLUME,
+        FUNCTION_KEY_FACTORY_UNIT_PRICE,
+        FUNCTION_KEY_FACTORY_RESET_AMOUNT,
+        FUNCTION_KEY_FACTORY_CALIBRATION,
+    };
+    return slot >= 1U && slot <= sizeof(defaults) / sizeof(defaults[0])
+               ? defaults[slot - 1U]
+               : NULL;
+}
+
+static void reset_function_key_store(function_key_store_t *store)
+{
+    memset(store, 0, sizeof(*store));
+    store->magic = FUNCTION_KEY_STORE_MAGIC;
+    store->version = FUNCTION_KEY_STORE_VERSION;
+
+    for (uint8_t slot = 1U; slot <= FUNCTION_KEY_SLOT_CALIBRATION; slot++) {
+        const char *factory_key = factory_function_key(slot);
+        function_key_config_t *config = &store->configs[slot - 1U];
+        strlcpy(config->factory_key, factory_key,
+                sizeof(config->factory_key));
+        strlcpy(config->edited_key, factory_key,
+                sizeof(config->edited_key));
+        store->count++;
+    }
+}
+
 static bool shortcut_character_is_valid(char character)
 {
     return (character >= '0' && character <= '9') ||
@@ -414,6 +458,58 @@ static bool calibration_store_is_valid(const calibration_store_t *store,
                 return false;
             }
         }
+    }
+    return occupied == store->count;
+}
+
+static bool function_key_entry_is_empty(const function_key_config_t *config)
+{
+    return config->factory_key[0] == '\0' && config->edited_key[0] == '\0';
+}
+
+static bool function_key_sequence_is_valid(uint8_t slot, const char *key)
+{
+    if (!shortcut_string_is_valid(key, FUNCTION_KEY_MAX_LENGTH)) {
+        return false;
+    }
+
+    size_t length = strlen(key);
+    if (slot == FUNCTION_KEY_SLOT_TOTAL_AMOUNT) {
+        return length > 1U && key[length - 1U] == 'E';
+    }
+    if (slot == FUNCTION_KEY_SLOT_RESET_AMOUNT) {
+        static const char suffix[] = "E000C";
+        return length > sizeof(suffix) - 1U &&
+               strcmp(key + length - (sizeof(suffix) - 1U), suffix) == 0;
+    }
+    return true;
+}
+
+static bool function_key_store_is_valid(const function_key_store_t *store)
+{
+    if (store->magic != FUNCTION_KEY_STORE_MAGIC ||
+        store->version != FUNCTION_KEY_STORE_VERSION ||
+        store->count > FUNCTION_KEY_CONFIG_MAX_COUNT) {
+        return false;
+    }
+
+    uint16_t occupied = 0U;
+    for (uint8_t slot = 1U; slot <= FUNCTION_KEY_CONFIG_MAX_COUNT; slot++) {
+        const function_key_config_t *config = &store->configs[slot - 1U];
+        const char *factory_key = factory_function_key(slot);
+        if (function_key_entry_is_empty(config)) {
+            if (factory_key != NULL) {
+                return false;
+            }
+            continue;
+        }
+        if (!function_key_sequence_is_valid(slot, config->factory_key) ||
+            !function_key_sequence_is_valid(slot, config->edited_key) ||
+            (factory_key != NULL &&
+             strcmp(config->factory_key, factory_key) != 0)) {
+            return false;
+        }
+        occupied++;
     }
     return occupied == store->count;
 }
@@ -701,6 +797,33 @@ esp_err_t device_settings_init(void)
         calibrations_need_write = true;
     }
 
+    /* Keep this large boot-only NVS buffer off the 3.5 KB main-task stack. */
+    static function_key_store_t stored_function_keys;
+    bool function_keys_need_write = false;
+    blob_size = sizeof(stored_function_keys);
+    err = nvs_get_blob(s_nvs_handle, FUNCTION_KEY_CONFIG_KEY,
+                       &stored_function_keys, &blob_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND ||
+        err == ESP_ERR_NVS_INVALID_LENGTH) {
+        if (err == ESP_ERR_NVS_INVALID_LENGTH) {
+            ESP_LOGW(TAG,
+                     "Function key config NVS sai kich thuoc, khoi phuc mac dinh");
+        }
+        reset_function_key_store(&stored_function_keys);
+        err = ESP_OK;
+        function_keys_need_write = true;
+    } else if (err != ESP_OK) {
+        nvs_close(s_nvs_handle);
+        return err;
+    } else if (blob_size != sizeof(stored_function_keys) ||
+               !function_key_store_is_valid(&stored_function_keys)) {
+        ESP_LOGW(TAG,
+                 "Function key config NVS khong hop le, khoi phuc mac dinh");
+        reset_function_key_store(&stored_function_keys);
+        err = ESP_OK;
+        function_keys_need_write = true;
+    }
+
     if (shortcuts_need_write) {
         err = nvs_set_blob(s_nvs_handle, SHORTCUT_MAPPING_KEY,
                            &stored_shortcuts, sizeof(stored_shortcuts));
@@ -710,8 +833,14 @@ esp_err_t device_settings_init(void)
                            &stored_calibrations,
                            sizeof(stored_calibrations));
     }
+    if (err == ESP_OK && function_keys_need_write) {
+        err = nvs_set_blob(s_nvs_handle, FUNCTION_KEY_CONFIG_KEY,
+                           &stored_function_keys,
+                           sizeof(stored_function_keys));
+    }
     if (err == ESP_OK &&
-        (shortcuts_need_write || calibrations_need_write)) {
+        (shortcuts_need_write || calibrations_need_write ||
+         function_keys_need_write)) {
         err = nvs_commit(s_nvs_handle);
     }
     if (err != ESP_OK) {
@@ -726,6 +855,10 @@ esp_err_t device_settings_init(void)
     portENTER_CRITICAL(&s_calibration_lock);
     s_calibration_store = stored_calibrations;
     portEXIT_CRITICAL(&s_calibration_lock);
+
+    portENTER_CRITICAL(&s_function_key_lock);
+    s_function_key_store = stored_function_keys;
+    portEXIT_CRITICAL(&s_function_key_lock);
 
     portENTER_CRITICAL(&s_core_config_lock);
     s_core_config = stored_core.config;
@@ -759,6 +892,10 @@ esp_err_t device_settings_init(void)
              (unsigned)stored_shortcuts.count, stored_shortcuts.revision);
     ESP_LOGI(TAG, "Khoi phuc %u calibration mapping tu Flash",
              (unsigned)stored_calibrations.count);
+    ESP_LOGI(TAG,
+             "Khoi phuc %u function key config, revision=%" PRIu32,
+             (unsigned)stored_function_keys.count,
+             stored_function_keys.revision);
     ESP_LOGI(TAG, "Khoi phuc mode_calibration=%s tu Flash/mac dinh",
              stored_mode);
     return ESP_OK;
@@ -1651,4 +1788,146 @@ bool device_settings_find_calibration_suffix(
     }
     *mapping = current.mappings[best_index];
     return true;
+}
+
+bool device_settings_function_key_config_is_valid(uint8_t slot,
+                                                  const char *factory_key,
+                                                  const char *edited_key)
+{
+    if (slot == 0U || slot > FUNCTION_KEY_CONFIG_MAX_COUNT ||
+        !function_key_sequence_is_valid(slot, factory_key) ||
+        !function_key_sequence_is_valid(slot, edited_key)) {
+        return false;
+    }
+
+    const char *expected_factory = factory_function_key(slot);
+    return expected_factory == NULL ||
+           strcmp(factory_key, expected_factory) == 0;
+}
+
+esp_err_t device_settings_set_function_key_config_at(
+    uint8_t slot,
+    const char *factory_key,
+    const char *edited_key,
+    uint32_t *revision)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!device_settings_function_key_config_is_valid(
+            slot, factory_key, edited_key)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    function_key_store_t updated;
+    portENTER_CRITICAL(&s_function_key_lock);
+    updated = s_function_key_store;
+    portEXIT_CRITICAL(&s_function_key_lock);
+
+    uint16_t index = (uint16_t)(slot - 1U);
+    function_key_config_t *config = &updated.configs[index];
+    if (!function_key_entry_is_empty(config) &&
+        strcmp(config->factory_key, factory_key) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!function_key_entry_is_empty(config) &&
+        strcmp(config->edited_key, edited_key) == 0) {
+        if (revision != NULL) {
+            *revision = updated.revision;
+        }
+        return ESP_OK;
+    }
+    if (function_key_entry_is_empty(config)) {
+        updated.count++;
+    }
+
+    memset(config, 0, sizeof(*config));
+    strlcpy(config->factory_key, factory_key, sizeof(config->factory_key));
+    strlcpy(config->edited_key, edited_key, sizeof(config->edited_key));
+    updated.revision++;
+    if (updated.revision == 0U) {
+        updated.revision = 1U;
+    }
+
+    esp_err_t err = nvs_set_blob(s_nvs_handle, FUNCTION_KEY_CONFIG_KEY,
+                                 &updated, sizeof(updated));
+    if (err == ESP_OK) {
+        err = nvs_commit(s_nvs_handle);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    function_key_store_t readback = {0};
+    size_t blob_size = sizeof(readback);
+    err = nvs_get_blob(s_nvs_handle, FUNCTION_KEY_CONFIG_KEY,
+                       &readback, &blob_size);
+    if (err != ESP_OK || blob_size != sizeof(readback) ||
+        memcmp(&readback, &updated, sizeof(updated)) != 0 ||
+        !function_key_store_is_valid(&readback)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    portENTER_CRITICAL(&s_function_key_lock);
+    s_function_key_store = readback;
+    portEXIT_CRITICAL(&s_function_key_lock);
+
+    if (revision != NULL) {
+        *revision = readback.revision;
+    }
+    ESP_LOGI(TAG,
+             "Da luu function key slot %u: %s -> %s, revision=%" PRIu32,
+             (unsigned)slot, factory_key, edited_key, readback.revision);
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_function_key_config_at(
+    uint8_t slot,
+    function_key_config_t *config,
+    uint32_t *revision)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (slot == 0U || slot > FUNCTION_KEY_CONFIG_MAX_COUNT ||
+        config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    function_key_store_t current;
+    portENTER_CRITICAL(&s_function_key_lock);
+    current = s_function_key_store;
+    portEXIT_CRITICAL(&s_function_key_lock);
+
+    uint16_t index = (uint16_t)(slot - 1U);
+    if (function_key_entry_is_empty(&current.configs[index])) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *config = current.configs[index];
+    if (revision != NULL) {
+        *revision = current.revision;
+    }
+    return ESP_OK;
+}
+
+esp_err_t device_settings_get_effective_function_key(uint8_t slot,
+                                                     char *key,
+                                                     size_t size)
+{
+    if (key == NULL || size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    function_key_config_t config = {0};
+    esp_err_t err = device_settings_get_function_key_config_at(
+        slot, &config, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t length = strlen(config.edited_key);
+    if (length + 1U > size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    strlcpy(key, config.edited_key, size);
+    return ESP_OK;
 }

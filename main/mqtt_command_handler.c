@@ -38,7 +38,7 @@
 #define DEDUP_HISTORY_LENGTH        16U
 #define VIRTUAL_KEY_INTERVAL_MS     60U
 #define SET_UNIT_PRICE_MAX          999999U
-#define SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH 24U
+#define SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH (FUNCTION_KEY_MAX_LENGTH + 12U)
 #define SET_UNIT_PRICE_MAX_ATTEMPTS  3U
 #define SET_UNIT_PRICE_VERIFY_TIMEOUT_MS 3000U
 #define SET_UNIT_PRICE_VERIFY_POLL_MS 50U
@@ -46,7 +46,6 @@
 #define TOTALIZER_VERIFY_TIMEOUT_MS 3000U
 #define TOTALIZER_DISPLAY_SETTLE_MS 1000U
 #define TOTALIZER_TELEMETRY_JSON_SIZE 256U
-#define CALIBRATION_ENTRY_SEQUENCE "C#122973E"
 #define CALIBRATION_MAX_ATTEMPTS   3U
 #define CALIBRATION_RAW_COMMAND_DELAY_MS 50U
 #define MQTT_PROTOCOL_VERSION          "1.3"
@@ -401,6 +400,7 @@ static bool command_name_is_declared(const char *command)
         "reset_totalizer",
         "send_calibration_command",
         "set_shortcut_mapping",
+        "set_function_key_config",
         "delete_shortcut_mapping",
         "get_reported_state",
         "OTA",
@@ -893,11 +893,53 @@ static uint32_t get_display_generation(void)
     return generation;
 }
 
+static esp_err_t get_function_key(uint8_t slot,
+                                  char key[FUNCTION_KEY_MAX_LENGTH + 1U])
+{
+    esp_err_t err = device_settings_get_effective_function_key(
+        slot, key, FUNCTION_KEY_MAX_LENGTH + 1U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Khong doc duoc function key slot %u: %s",
+                 (unsigned)slot, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t get_function_key_prefix(uint8_t slot,
+                                         const char *suffix,
+                                         char *prefix,
+                                         size_t prefix_size)
+{
+    char key[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t err = get_function_key(slot, key);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t key_length = strlen(key);
+    size_t suffix_length = strlen(suffix);
+    if (key_length <= suffix_length ||
+        strcmp(key + key_length - suffix_length, suffix) != 0 ||
+        key_length - suffix_length + 1U > prefix_size) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(prefix, key, key_length - suffix_length);
+    prefix[key_length - suffix_length] = '\0';
+    return ESP_OK;
+}
+
 static esp_err_t execute_calibration_locked(const char *raw_command,
                                             uint32_t max_attempts)
 {
     if (max_attempts == 0U) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    char calibration_entry[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key(
+        FUNCTION_KEY_SLOT_CALIBRATION, calibration_entry);
+    if (config_err != ESP_OK) {
+        return config_err;
     }
 
     for (uint32_t attempt = 1U; attempt <= max_attempts; attempt++) {
@@ -906,7 +948,7 @@ static esp_err_t execute_calibration_locked(const char *raw_command,
 
         uint32_t baseline_generation = get_display_generation();
         esp_err_t err = virtual_key_output_run_sequence(
-            CALIBRATION_ENTRY_SEQUENCE, VIRTUAL_KEY_INTERVAL_MS);
+            calibration_entry, VIRTUAL_KEY_INTERVAL_MS);
         if (err == ESP_OK &&
             wait_for_calibration_display(baseline_generation, NULL,
                                          true, false)) {
@@ -987,6 +1029,13 @@ esp_err_t mqtt_command_handler_check_boot_calibration(
     }
 
     esp_err_t result = ESP_ERR_INVALID_RESPONSE;
+    char calibration_entry[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key(
+        FUNCTION_KEY_SLOT_CALIBRATION, calibration_entry);
+    if (config_err != ESP_OK) {
+        xSemaphoreGive(s_totalizer_mutex);
+        return config_err;
+    }
     for (uint32_t attempt = 1U; attempt <= CALIBRATION_MAX_ATTEMPTS;
          attempt++) {
         ESP_LOGI(TAG, "Kiem tra calibration boot %s lan %u/%u",
@@ -995,7 +1044,7 @@ esp_err_t mqtt_command_handler_check_boot_calibration(
 
         uint32_t baseline_generation = get_display_generation();
         esp_err_t err = virtual_key_output_run_sequence(
-            CALIBRATION_ENTRY_SEQUENCE, VIRTUAL_KEY_INTERVAL_MS);
+            calibration_entry, VIRTUAL_KEY_INTERVAL_MS);
         char actual_command[BOOT_CALIBRATION_VALUE_MAX_LENGTH + 1U] = {0};
         if (err != ESP_OK ||
             !wait_for_boot_calibration_screen(baseline_generation,
@@ -1190,11 +1239,19 @@ static esp_err_t read_total_amount(
     uint64_t *total_amount_vnd,
     uint8_t amount_segments[TOTALIZER_LED_COLUMNS])
 {
+    char entry_prefix[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key_prefix(
+        FUNCTION_KEY_SLOT_TOTAL_AMOUNT, "E",
+        entry_prefix, sizeof(entry_prefix));
+    if (config_err != ESP_OK) {
+        return config_err;
+    }
+
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Doc tong tien lan %u/%u",
                  (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
         esp_err_t err = virtual_key_output_run_sequence(
-            "C#7733", VIRTUAL_KEY_INTERVAL_MS);
+            entry_prefix, VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
@@ -1226,13 +1283,20 @@ static esp_err_t read_total_amount(
 
 static esp_err_t read_total_volume(double *total_volume_l)
 {
+    char entry_sequence[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key(
+        FUNCTION_KEY_SLOT_TOTAL_VOLUME, entry_sequence);
+    if (config_err != ESP_OK) {
+        return config_err;
+    }
+
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Doc tong lit lan %u/%u",
                  (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
 
         uint32_t baseline_generation = get_display_generation();
         esp_err_t err = virtual_key_output_run_sequence(
-            "C#44504ET", VIRTUAL_KEY_INTERVAL_MS);
+            entry_sequence, VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
@@ -1311,12 +1375,20 @@ static esp_err_t reset_totalizer(void)
 
 static esp_err_t reset_total_amount(void)
 {
+    char entry_prefix[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key_prefix(
+        FUNCTION_KEY_SLOT_RESET_AMOUNT, "E000C",
+        entry_prefix, sizeof(entry_prefix));
+    if (config_err != ESP_OK) {
+        return config_err;
+    }
+
     for (uint32_t attempt = 1U; attempt <= TOTALIZER_MAX_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Reset tong tien lan %u/%u",
                  (unsigned)attempt, (unsigned)TOTALIZER_MAX_ATTEMPTS);
 
         esp_err_t err = virtual_key_output_run_sequence(
-            "C#7733", VIRTUAL_KEY_INTERVAL_MS);
+            entry_prefix, VIRTUAL_KEY_INTERVAL_MS);
         if (err != ESP_OK) {
             return err;
         }
@@ -1465,9 +1537,16 @@ static esp_err_t publish_totalizer_telemetry(uint64_t total_amount_vnd,
 
 static esp_err_t execute_set_unit_price(uint32_t unit_price)
 {
+    char function_key[FUNCTION_KEY_MAX_LENGTH + 1U];
+    esp_err_t config_err = get_function_key(
+        FUNCTION_KEY_SLOT_UNIT_PRICE, function_key);
+    if (config_err != ESP_OK) {
+        return config_err;
+    }
+
     char entry_sequence[SET_UNIT_PRICE_SEQUENCE_MAX_LENGTH];
     int written = snprintf(entry_sequence, sizeof(entry_sequence),
-                           "C#44504EP%" PRIu32, unit_price);
+                           "%s%" PRIu32, function_key, unit_price);
     if (written < 0 || (size_t)written >= sizeof(entry_sequence)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -1681,6 +1760,90 @@ static esp_err_t publish_shortcut_mapping_ack(
                       "slot=%u %s -> %s revision=%" PRIu32,
                  (unsigned)slot, mapping->shortcut_key,
                  mapping->physical_key, revision);
+    }
+    cJSON_free(payload);
+    return err;
+}
+
+static esp_err_t publish_function_key_config_ack(
+    const char *request_id,
+    const function_key_config_t *config,
+    uint8_t slot,
+    uint32_t revision)
+{
+    time_manager_snapshot_t snapshot;
+    esp_err_t err = time_manager_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char factory_field[24];
+    char edited_field[24];
+    int factory_length = snprintf(factory_field, sizeof(factory_field),
+                                  "factory_key_%u", (unsigned)slot);
+    int edited_length = snprintf(edited_field, sizeof(edited_field),
+                                 "edited_key_%u", (unsigned)slot);
+    if (factory_length <= 0 || factory_length >= (int)sizeof(factory_field) ||
+        edited_length <= 0 || edited_length >= (int)sizeof(edited_field)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *reported = cJSON_CreateObject();
+    cJSON *mapping = cJSON_CreateObject();
+    if (root == NULL || reported == NULL || mapping == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(reported);
+        cJSON_Delete(mapping);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool mapping_built =
+        cJSON_AddStringToObject(mapping, factory_field,
+                                config->factory_key) != NULL &&
+        cJSON_AddStringToObject(mapping, edited_field,
+                                config->edited_key) != NULL;
+    bool mapping_attached = mapping_built &&
+        cJSON_AddItemToObject(reported, "mapping", mapping);
+    bool reported_built = mapping_attached &&
+        cJSON_AddNumberToObject(reported, "revision", revision) != NULL;
+    bool root_built = reported_built &&
+        cJSON_AddNumberToObject(root, "ts", (double)snapshot.ts) != NULL &&
+        cJSON_AddStringToObject(root, "version",
+                                MQTT_PROTOCOL_VERSION) != NULL &&
+        cJSON_AddStringToObject(root, "request_id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "ack_to",
+                                "set_function_key_config") != NULL &&
+        cJSON_AddStringToObject(root, "result", "ok") != NULL &&
+        cJSON_AddStringToObject(root, "description",
+                                "function_key_updated") != NULL;
+    bool reported_attached = root_built &&
+        cJSON_AddItemToObject(root, "reported", reported);
+    bool built = reported_attached &&
+        cJSON_AddStringToObject(root, "time_device",
+                                snapshot.time_device) != NULL;
+    if (!built) {
+        if (!reported_attached) {
+            cJSON_Delete(reported);
+        }
+        if (!mapping_attached) {
+            cJSON_Delete(mapping);
+        }
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = mqtt_manager_publish_ack(payload);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "ACK function key queued: slot=%u %s -> %s revision=%" PRIu32,
+                 (unsigned)slot, config->factory_key,
+                 config->edited_key, revision);
     }
     cJSON_free(payload);
     return err;
@@ -2074,6 +2237,85 @@ static void process_command(const command_message_t *message)
         } else {
             ESP_LOGE(TAG, "Publish ACK OTA that bai: %s",
                      esp_err_to_name(ack_err));
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(command->valuestring, "set_function_key_config") == 0) {
+        const cJSON *factory_key = NULL;
+        const cJSON *edited_key = NULL;
+        uint8_t slot = 0U;
+        bool pair_valid = envelope_valid && get_indexed_param_pair(
+            param, "factory_key", "edited_key",
+            FUNCTION_KEY_CONFIG_MAX_COUNT,
+            &factory_key, &edited_key, &slot);
+        bool param_valid = pair_valid &&
+            string_field_is_valid(factory_key, FUNCTION_KEY_MAX_LENGTH) &&
+            string_field_is_valid(edited_key, FUNCTION_KEY_MAX_LENGTH) &&
+            device_settings_function_key_config_is_valid(
+                slot, factory_key->valuestring, edited_key->valuestring);
+        if (!param_valid) {
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", "invalid_param", false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        uint32_t revision = 0U;
+        esp_err_t err = device_settings_set_function_key_config_at(
+            slot, factory_key->valuestring, edited_key->valuestring,
+            &revision);
+        function_key_config_t readback = {0};
+        uint32_t readback_revision = 0U;
+        if (err == ESP_OK) {
+            err = device_settings_get_function_key_config_at(
+                slot, &readback, &readback_revision);
+            if (err == ESP_OK &&
+                (strcmp(readback.factory_key,
+                        factory_key->valuestring) != 0 ||
+                 strcmp(readback.edited_key,
+                        edited_key->valuestring) != 0 ||
+                 readback_revision != revision)) {
+                err = ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+
+        if (err != ESP_OK) {
+            const char *description =
+                (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_NOT_FOUND)
+                    ? "verification_failed"
+                    : (err == ESP_ERR_INVALID_ARG
+                           ? "invalid_param"
+                           : (err == ESP_ERR_INVALID_STATE
+                                  ? "internal_error"
+                                  : "storage_error"));
+            ESP_LOGE(TAG, "Cap nhat function key slot %u that bai: %s",
+                     (unsigned)slot, esp_err_to_name(err));
+            esp_err_t ack_err = publish_ack(
+                request_id->valuestring, command->valuestring,
+                "error", description, false, 0U, false, false,
+                false, 0U, 0.0);
+            if (ack_err == ESP_OK) {
+                remember_request(request_id->valuestring);
+            }
+            cJSON_Delete(root);
+            return;
+        }
+
+        err = publish_function_key_config_ack(
+            request_id->valuestring, &readback, slot,
+            readback_revision);
+        if (err == ESP_OK) {
+            remember_request(request_id->valuestring);
+        } else {
+            ESP_LOGE(TAG, "Publish ACK function key that bai: %s",
+                     esp_err_to_name(err));
         }
         cJSON_Delete(root);
         return;
